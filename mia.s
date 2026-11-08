@@ -587,7 +587,7 @@ Lc\@:	.asciz	"\text"
 .equ TRACKS,                     8
 .equ RQS,                        16       ; requests at once
 .equ STREAMS,                    3        ; network streams: picture, sound, subtitles
-.equ FIFO_N,                     2048     ; samples a track's queue holds
+.equ FIFO_N,                     4096     ; samples a track's queue holds
 .equ AHEAD_V,                    480      ; queued pictures and sound packets before a stream stops fetching
 .equ AHEAD_A,                    768
 .equ AHEAD_S,                    64       ; and cues
@@ -715,6 +715,7 @@ Lc\@:	.asciz	"\text"
 .equ TR_MTOL,                    460      ; w: the timestamps' rounding: a sound packet within it of the last one's end follows it
 .equ TR_MEST,                    464      ; w: TR_MDDUR is the smallest step between a picture's frames seen so far (the file gives none)
 .equ TR_MWAIT,                   468      ; w: a stream's cursor waits for bytes: it reads on from TR_XEND when they come
+.equ TR_AREM,                    472
 .equ TR_MPREB,                   480      ; header stripping's bytes (at most 16)
 .equ TR_XDTS,                    496      ; Matroska: the last picture's decode time, made up (1 << 63: none since the seek)
 .equ TR_XKEY,                    504      ; where reading starts for the cursor's frame: its tag, its cluster
@@ -802,7 +803,10 @@ Lc\@:	.asciz	"\text"
 .equ ST_XKEYS,                   ST_XIDXN + 8 ; Matroska, FLV: the pictures' key frames read so far, {where reading starts for one, its time in ms}, in file order (XKEYS_N at most), owned, and their count
 .equ ST_XKEYN,                   ST_XKEYS + 8
 .equ ST_XLEN,                    ST_XKEYN + 8 ; the stream's length from a range's answer
-.equ ST_SIZE,                    ST_XLEN + 8
+.equ ST_HUNGRY,                  ST_XLEN + 8
+.equ ST_PAUSEAT,                 ST_HUNGRY + 8
+.equ ST_SEGOFF,                  ST_PAUSEAT + 8
+.equ ST_SIZE,                    ST_SEGOFF + 8
 
 ; Track: title, artist and artwork URL.
 .equ T_TITLE,                    0        ; char[512]
@@ -4756,28 +4760,31 @@ fetch:
 	.equ SP_URL,	16                ; char[4200]: a live segment's URL
 	.equ SP_SIZE,	4224
 st_pump:
-	FRAME	2, SP_SIZE, 1
-	cbz	x19, Lret2
+	FRAME	3, SP_SIZE, 1
+	cbz	x19, Lret3
 	ldr	x9, [x19, #ST_URL]
 	ldr	x10, [x19, #ST_PLURL]
 	orr	x9, x9, x10
-	cbz	x9, Lret2
-	ldr	w9, [x19, #ST_FETCH]
-	ldr	w10, [x19, #ST_EOS]
-	ldr	w11, [x19, #ST_RETRY]
-	orr	w9, w9, w10
-	orr	w9, w9, w11
-	cbnz	w9, Lret2
-	add	x20, x19, #ST_TR
+	cbz	x9, Lret3
+	bl	now_ms
+	mov	x20, x0
+	ldr	w24, [x19, #ST_FETCH]
+	lsr	w15, w24, #1
+	mov	w14, #0
+	mov	w22, #0
+	add	x23, x19, #ST_TR
 	mov	w21, #2
 Lpu_full:
-	ldr	x9, [x20], #8
+	ldr	x9, [x23], #8
 	cbz	x9, 1f
 	ldr	w10, [x28, #G_AONLY]
 	ldr	x11, [x27, #E_VT]
 	cmp	x11, x9
 	ccmp	w10, #0, #4, eq
 	b.ne	1f                        ; Audio Only's picture: not waited for
+	mov	x0, x9
+	bl	ahead_ms
+	ldur	x9, [x23, #-8]
 	ldp	w10, w11, [x9, #TR_FH]
 	sub	w10, w11, w10
 	ldr	w11, [x9, #TR_KIND]
@@ -4785,19 +4792,71 @@ Lpu_full:
 	cmp	w11, #'v'
 	mov	w13, #AHEAD_A
 	csel	w12, w12, w13, eq
-	cmp	w11, #'s'
+	subs	w16, w11, #'s'
 	mov	w13, #AHEAD_S
 	csel	w12, w13, w12, eq
+	cmp	w10, #(FIFO_N - 16)
+	mov	x13, #STALL_FULL
+	ccmp	x0, x13, #0, lo
+	ccmp	w16, #0, #4, lt
+	csinc	w14, w14, wzr, eq
+	lsr	w12, w12, w15
 	cmp	w10, w12
-	b.hs	Lret2                     ; enough ahead
+	csinc	w22, w22, wzr, lo
 1:	subs	w21, w21, #1
 	b.ne	Lpu_full
+	ldr	x9, [x19, #ST_ARCAP]
+	tst	x9, #~((ARENA_MAX << 2) - 1)
+	bic	w22, w22, w14
+	csel	w14, w14, wzr, ne
+	str	w14, [x19, #ST_HUNGRY]
+	ldr	x9, [x19, #ST_AR]
+	cbz	x9, 1f
+	mov	x0, x19
+	bl	emit
+1:	cbz	w24, 2f
+	ldr	w10, [x19, #ST_KIND]
+	cmp	w10, #1
+	b.eq	Lret3
+	ldr	x10, [x19, #ST_XLEN]
+	cbnz	x10, Lret3
+	tbnz	w24, #2, Lret3
+	add	w10, w22, #1
+	cmp	w24, w10
+	b.ne	4f
+	cbz	w22, Lret3
+	bl	now_ns
+	ldr	x9, [x19, #ST_PAUSEAT]
+	sub	x0, x0, x9
+	lsr	x0, x0, #34
+	cbz	x0, Lret3
+	mov	w10, #5
+	mov	w22, #0
+4:	str	w10, [x19, #ST_FETCH]
+	ldr	x1, [x27, #S_resume]
+	cbz	w22, 3f
+	bl	now_ns
+	str	x0, [x19, #ST_PAUSEAT]
+	adr	x0, Ls_suspend
+	bl	_sel_registerName
+	mov	x1, x0
+3:	ldr	x0, [x19, #(ST_RQ + RQ_TASK)]
+	bl	_objc_msgSend
+	b	Lret3
+Ls_suspend:
+	.asciz	"suspend"
+	.p2align 2
+2:	ldr	w9, [x19, #ST_EOS]
+	ldr	w10, [x19, #ST_RETRY]
+	orr	w9, w9, w22
+	orr	w9, w9, w10
+	cbnz	w9, Lret3
 	ldr	w9, [x19, #ST_KIND]
 	cmp	w9, #1
 	b.ne	2f
 	mov	x0, x19                   ; HLS: its playlist and segments
 	bl	hls_pump
-	b	Lret2
+	b	Lret3
 2:	ldr	w9, [x19, #ST_FRAG]       ; a whole file read so far: nothing past its media data
 	ldr	x10, [x19, #ST_MOOV]
 	cmp	w9, #0
@@ -4807,70 +4866,32 @@ Lpu_full:
 	ldr	x10, [x19, #ST_MDEND]
 	cmp	x9, x10
 	b.hs	Lpu_end
-1:	ldr	x0, [x19, #ST_URL]
+1:	ldr	x1, [x19, #ST_URL]
 	ldr	w9, [x19, #ST_LIVE]
 	cbz	w9, Lpu_req
 	ldr	x9, [x19, #ST_SQ]
 	cbz	x9, Lpu_req               ; the first asks for the newest segment
-	stp	x0, x9, [sp]
+	stp	x1, x9, [sp]
 	add	x0, sp, #SP_URL
 	mov	x1, #4200
 	CSTR	x2, "%s&sq=%ld"
 	bl	_snprintf
-	add	x0, sp, #SP_URL
+	add	x1, sp, #SP_URL
 Lpu_req:
-	bl	mkreq
-	cbz	x0, Lpu_end
-	mov	x20, x0
-	ldr	w9, [x19, #ST_LIVE]
-	cbnz	w9, Lpu_go
-	ldr	x9, [x19, #ST_POS]        ; a byte range: googlevideo slows anything larger to real time
-	mov	x10, #CHUNK
-	add	x10, x9, x10
-	sub	x10, x10, #1
-	ldr	x11, [x19, #ST_LEN]
-	sub	x12, x11, #1
-	cmp	x11, #0
-	ccmp	x10, x12, #0, ne
-	csel	x10, x12, x10, hi
-	stp	x9, x10, [sp]
-	add	x0, sp, #SP_URL
-	mov	x1, #64
-	GADDR	x2, Ls_bytes
-	bl	_snprintf
-	add	x0, sp, #SP_URL
-	bl	mkstr
-	mov	x21, x0
-	GADDR	x0, Ls_range
-	bl	mkstr
-	mov	x3, x0
-	mov	x2, x21
-	mov	x0, x20
-	SEND	S_setValue_forHTTPHeaderField_
-Lpu_go:
-	ldr	x0, [x19, #ST_URL]
-	GADDR	x1, Ls_gvideo
-	bl	_strstr
-	cbz	x0, 1f
-	mov	x0, x20                   ; YouTube's CDN speaks QUIC
-	mov	w2, #1
-	SEND	S_setAssumesHTTP3Capable_
-1:	adr	x9, st_sink
-	adr	x10, st_done
-	stp	x9, x10, [x19, #(ST_RQ + RQ_SINK)]
-	str	x20, [x19, #(ST_RQ + RQ_REQ)]
-	mov	w9, #1
-	str	w9, [x19, #ST_FETCH]
-	str	xzr, [x19, #ST_GOT]
-	str	wzr, [x19, #ST_ANS]
-	str	xzr, [x19, #ST_SKIP]
-	add	x0, x19, #ST_RQ
-	bl	Lnet_start
-	b	Lret2
+	mov	x0, x19
+	mov	w2, #0
+	ldr	x3, [x19, #ST_POS]
+	mov	x4, #0
+	bl	st_get
+	b	Lret3
 Lpu_end:
 	mov	x0, x19
 	bl	st_end
-	b	Lret2
+	b	Lret3
+
+now_ns:
+	mov	w0, #CLOCK_UPTIME_RAW
+	b	_clock_gettime_nsec_np
 
 ; st_end(stream) — no more bytes; if nothing playable came at all, AVPlayer gets the media instead.
 st_end:
@@ -4894,6 +4915,9 @@ st_sink:
 	mov	x20, x1
 	mov	x21, x2
 	mov	x22, x3
+	ldr	w9, [x19, #ST_FETCH]
+	and	w9, w9, #3
+	str	w9, [x19, #ST_FETCH]
 	ldr	w9, [x19, #ST_ANS]
 	cbnz	w9, 1f
 	mov	w9, #1
@@ -4913,6 +4937,8 @@ st_sink:
 2:	cmp	x0, #200
 	b.ne	1f
 	ldr	x9, [x19, #ST_POS]        ; the whole stream instead of the range: what lies before the position is dropped
+	ldr	x10, [x19, #ST_SKIP]
+	add	x9, x9, x10
 	str	x9, [x19, #ST_SKIP]
 1:	ldr	w9, [x19, #ST_ANS]
 	tbnz	w9, #1, Lret2             ; refused
@@ -4938,7 +4964,7 @@ st_sink:
 	ldr	w9, [x19, #ST_ENC]
 	cbnz	w9, Lsn_text              ; encrypted: decrypted whole
 	bl	seg_bytes
-	b	Lret2
+	b	Lsn_pump
 Lsn_bytes:
 	ldr	w9, [x19, #ST_KIND]
 	ldr	x10, [x19, #ST_SPOS]
@@ -4998,13 +5024,13 @@ Lsn_box:
 Lsn_parse:
 	ldr	w9, [x19, #ST_KIND]
 	cmp	w9, #2
-	b.lo	1f
-	b.hi	2f
-	bl	afs_sfeed
-	b	Lret2
-1:	bl	st_parse
-	b	Lret2
+	b.hs	2f
+	bl	st_parse
+	b	Lsn_pump
 2:	bl	xs_sink
+Lsn_pump:
+	mov	x0, x19
+	bl	st_trim
 	b	Lret2
 Lsn_bad:
 	mov	w9, #3
@@ -5018,6 +5044,23 @@ st_done:
 	mov	w20, w1
 	mov	x21, x2
 	str	wzr, [x19, #ST_FETCH]
+	ldr	w9, [x19, #ST_REQT]
+	ldr	x10, [x19, #ST_TXTN]
+	ldr	w11, [x19, #ST_LIVE]
+	cmp	w9, #3
+	ccmp	x10, #0, #0, eq
+	ccmp	w11, #0, #0, ne
+	b.eq	6f
+	ldr	x9, [x19, #ST_GOT]
+	cbz	x9, 8f
+	str	wzr, [x19, #ST_ERRS]
+8:	ldr	x10, [x19, #ST_SEGOFF]
+	add	x9, x9, x10
+	str	x9, [x19, #ST_GOT]
+	cmp	w20, #0
+	csel	x9, x9, xzr, eq
+	str	x9, [x19, #ST_SEGOFF]
+6:
 	ldr	w9, [x19, #ST_KIND]
 	cmp	w9, #1
 	b.ne	1f
@@ -5026,25 +5069,25 @@ st_done:
 	bl	hls_done
 	b	Lret2
 1:
-	ldr	w9, [x19, #ST_LIVE]
-	cbnz	w9, Lsd_live
+	cbnz	w11, Lsd_live
 	ldp	x9, x10, [x19, #ST_POS]   ; ST_POS, and the parsed position
 	ldr	x11, [x19, #ST_GOT]
 	add	x9, x9, x11
 	str	x9, [x19, #ST_POS]
-	cbz	w20, Lsd_fail
+	cbz	x11, 7f
+	str	wzr, [x19, #ST_ERRS]
+7:	cbz	w20, Lsd_fail
 	cbz	x11, Lsd_end              ; nothing more
+	ldr	x10, [x19, #ST_XLEN]
+	cmp	x10, #0
+	ccmp	x9, x10, #0, ne
+	b.hs	Lsd_end
 	mov	x0, x21
 	SEND	S_response
 	SEND	S_statusCode
 	cmp	x0, #206
 	b.ne	Lsd_end                   ; not a range: the whole stream came
-	str	wzr, [x19, #ST_ERRS]
-	ldr	x10, [x19, #ST_XLEN]
-	cbz	x10, 1f
-	cmp	x9, x10
-	b.hs	Lsd_end
-1:	mov	x0, x21                   ; the CDN's redirect: later requests go straight there
+	mov	x0, x21                   ; the CDN's redirect: later requests go straight there
 	SEND	S_response
 	SEND	S_URL
 	SEND	S_absoluteString
@@ -5066,25 +5109,24 @@ Lsd_pump:
 	bl	st_pump
 	b	Lret2
 Lsd_live:
-	cbz	w20, Lsd_fail
-	str	wzr, [x19, #ST_ERRS]
 	ldr	x9, [x19, #ST_SQ]
 	cbnz	x9, Lsd_seg
 	mov	x0, x21                   ; the newest segment's number: the next is after it
 	SEND	S_response
-	mov	x20, x0
+	mov	x22, x0
 	CSTR	x0, "X-Sequence-Num"
 	bl	mkstr
 	mov	x2, x0
-	mov	x0, x20
+	mov	x0, x22
 	SEND	S_valueForHTTPHeaderField_
 	SEND	S_UTF8String
-	cbz	x0, Lsd_end
+	cbz	x0, Lsd_nosq
 	bl	strtol10
-	add	x0, x0, #1
+	mov	x9, x0
 	str	x0, [x19, #ST_SQ]
-	b	Lsd_pump
 Lsd_seg:
+	cbz	w20, Lsd_fail
+	str	wzr, [x19, #ST_ERRS]
 	ldr	x10, [x19, #ST_GOT]
 	cbz	x10, Lsd_later            ; not out yet
 	add	x9, x9, #1
@@ -5103,17 +5145,12 @@ Lsd_fail:
 	cmp	w9, #NET_TRIES
 	b.hs	Lsd_end
 Lsd_later:
-	mov	w9, #1
-	str	w9, [x19, #ST_RETRY]
-	mov	x0, #0
-	mov	w1, #(RETRY_NS & 0xffff)
-	movk	w1, #(RETRY_NS >> 16), lsl #16
-	bl	_dispatch_time
-	ldr	x1, [x28, #G_MEDIAQ]
-	mov	x2, x19
-	adr	x3, st_retry
-	bl	_dispatch_after_f
+	mov	w0, #(RETRY_NS / 500000)
+	mov	x1, x19
+	bl	st_later
 	b	Lret2
+Lsd_nosq:
+	cbz	w20, Lsd_fail
 Lsd_end:
 	mov	x0, x19
 	bl	st_end
@@ -5145,7 +5182,29 @@ st_reset:
 	stp	wzr, wzr, [x19, #ST_FETCH]
 	str	wzr, [x19, #ST_ERRS]
 	str	wzr, [x19, #ST_RETRY]
+	str	xzr, [x19, #ST_SEGOFF]
 	b	Lret1
+
+st_trim:
+	ldr	x9, [x0, #ST_ARCAP]
+	ldr	w10, [x0, #ST_KIND]
+	tst	x9, #~((ARENA_MAX << 3) - 1)
+	ccmp	w10, #1, #4, ne
+	b.eq	st_pump
+	ldr	w11, [x0, #ST_PST]
+	cmp	w10, #0
+	ccmp	w11, #2, #4, eq
+	b.ne	st_pump
+	FRAME	3, 0, 1
+	bl	st_keep
+	cbz	x0, Lsk_hgo
+	ldr	x9, [x19, #ST_SPOS]
+	cmp	x0, x9
+	csel	x20, x0, x9, lo
+	mov	x0, x19
+	bl	st_reset
+	mov	x0, x20
+	b	Lsk_rew
 
 ; st_seek(stream, ms) — its tracks drop what is queued and start again at the sync sample before that moment; a stream without its index yet starts over and seeks once it has it.
 st_seek:
@@ -5180,11 +5239,13 @@ Lsk_tr:
 Lsk_whole:
 	mov	x0, x19                   ; a whole file: the cursors find the samples, the stream reads from the earliest
 	bl	st_cursors
-	mov	w9, #2
-	str	w9, [x19, #ST_PST]
+Lsk_rew:
 	ldr	x9, [x19, #ST_MDEND]
-	sub	x9, x9, x0
+	subs	x9, x9, x0
 	str	x9, [x19, #ST_LEFT]
+	mov	w9, #2
+	csel	w9, w9, wzr, ne
+	str	w9, [x19, #ST_PST]
 	b	Lsk_go
 Lsk_hls:
 	str	xzr, [x19, #ST_SEQ]       ; HLS: the segment from the playlist, or when it comes
@@ -5208,9 +5269,7 @@ Lsk_hls:
 	str	x9, [x19, #ST_SEQ]
 Lsk_hgo:
 	str	wzr, [x19, #ST_EOS]
-	mov	x0, x19
-	bl	st_pump
-	b	Lret3
+	b	Lhd_next
 Lsk_afs:
 	ldr	x0, [x19, #ST_TR]         ; sound: from AudioFileStream's byte for the moment
 	cbz	x0, Lsk_top
@@ -5229,9 +5288,7 @@ Lsk_go:
 	str	x0, [x19, #ST_POS]
 	str	x0, [x19, #ST_SPOS]
 	str	xzr, [x19, #ST_EOS]
-	mov	x0, x19
-	bl	st_pump
-	b	Lret3
+	b	Lhd_next
 Lsk_x:
 	ldr	w9, [x19, #ST_XHEAD]
 	cbz	w9, Lsk_top               ; Matroska, FLV: the header first, its tracks then at the target
@@ -5252,33 +5309,26 @@ trk_target:
 	FRAME	1, 0, 1
 	mov	x9, #-1
 	str	x9, [x19, #TR_APTS]       ; packed sound times itself again
-	ldr	w9, [x19, #TR_TS]
-	mul	x1, x1, x9
-	mov	x9, #1000
-	udiv	x1, x1, x9
-	str	x1, [x19, #TR_TGT]
+	str	xzr, [x19, #TR_LAST]
+	bl	trk_tgt
 	bl	q_clear
 	b	Lret1
 
 ; st_cursors(stream) -> x0 = where the stream reads from: each whole-file track at the sync sample before its target, the earliest of them.
 st_cursors:
 	FRAME	2
-	mov	x20, x0
+	add	x20, x0, #(ST_TR + 16)
+	add	x22, x0, #ST_TR
 	mov	x21, #0x7fffffffffffffff
-	add	x22, x20, #ST_TR
-	ldr	x19, [x22]
-	cbz	x19, 1f
-	bl	trk_seek
-	ldr	x9, [x19, #TR_OFF]
-	cmp	x9, x21
-	csel	x21, x9, x21, lo
-1:	ldr	x19, [x22, #8]
+1:	ldr	x19, [x22], #8
 	cbz	x19, 2f
 	bl	trk_seek
 	ldr	x9, [x19, #TR_OFF]
 	cmp	x9, x21
 	csel	x21, x9, x21, lo
-2:	mov	x0, x21
+2:	cmp	x22, x20
+	b.ne	1b
+	mov	x0, x21
 	b	Lret2
 
 ; trk_seek — the cursor at the sync sample before the track's target (preroll for sound) (x19 = track).
@@ -5363,26 +5413,21 @@ Lsp_skip:
 	str	wzr, [x19, #ST_PST]       ; skipped
 	b	Lsp_loop
 Lsp_media:
-	ldp	x9, x10, [x19, #ST_ARN]   ; ST_ARN, ST_ARCAP
-	ldr	x11, [x19, #ST_AR]
-	cbz	x11, 1f
+	ldr	x9, [x19, #ST_SPOS]
+	ldr	x12, [x19, #ST_ARPOS]
+	ldr	x10, [x19, #ST_ARCAP]
+	sub	x9, x9, x12
 	cmp	x9, x10
 	b.lo	2f
-1:	mov	x0, x19                   ; a new arena, from the earliest sample not yet given
+	mov	x0, x19                   ; a new arena, from the earliest sample not yet given
 	bl	arena_new
 	cbz	x0, Lsp_dead
 	ldp	x9, x10, [x19, #ST_ARN]
-2:	sub	x10, x10, x9              ; room
+2:	str	x9, [x19, #ST_ARN]
+	sub	x10, x10, x9              ; room
 	cmp	x22, x10
 	csel	x22, x22, x10, lo
-	ldr	x0, [x19, #ST_AR]
-	add	x0, x0, x9
-	mov	x1, x20
-	mov	x2, x22
-	bl	_memcpy
-	ldr	x9, [x19, #ST_ARN]
-	add	x9, x9, x22
-	str	x9, [x19, #ST_ARN]
+	bl	ar_put
 	bl	Lsp_eat
 	mov	x0, x19
 	bl	emit
@@ -5459,8 +5504,9 @@ Lsp_keep:
 	mov	x15, #BOX_MAX
 	cmp	x10, x15
 	b.hi	Lsp_state
-	mov	x0, x10
-	bl	_malloc
+	ldr	x0, [x19, #ST_BBUF]
+	mov	x1, x10
+	bl	_realloc
 	cbz	x0, Lsp_dead
 	stp	x0, xzr, [x19, #ST_BBUF]
 	mov	w9, #1
@@ -5483,9 +5529,7 @@ Lsp_mdat:
 	ldr	x9, [x19, #ST_MDEND]
 	str	x9, [x19, #ST_POS]
 	str	x9, [x19, #ST_SPOS]
-	mov	x0, x19
-	bl	st_pump
-	b	Lret3
+	b	Lhd_next
 4:	ldr	x9, [x19, #ST_SPOS]
 	add	x10, x9, x10
 	str	x10, [x19, #ST_MDEND]
@@ -5521,22 +5565,24 @@ arena_new:
 	ldr	x11, [x19, #ST_AR]
 	ldr	x12, [x19, #ST_SPOS]
 	cmp	x11, #0
-	ccmp	x10, x12, #0, ne          ; its bytes carry over only if the new ones follow them
-	b.ne	1f
+	ccmp	x10, x12, #2, ne          ; its bytes carry over only if the new ones follow them
+	b.hi	1f
 	cmp	x0, x9
 	csel	x0, x0, x9, hs
 	cmp	x0, x10
-	csel	x0, x0, x10, ls
-	b	2f
+	b.lo	2f
 1:	mov	x0, x12                   ; else from here
 	mov	x10, x0
 2:	mov	x20, x0
 	sub	x21, x10, x0              ; bytes carried over
+	sub	x24, x12, x0
 	ldr	x9, [x19, #ST_LEFT]
 	mov	x10, #ARENA_MAX
 	cmp	x9, x10
 	csel	x9, x9, x10, lo
-	add	x22, x9, x21
+	cmp	x9, x24
+	csel	x9, x9, x24, hs
+	add	x22, x9, x24
 	mov	x0, x22
 	bl	_malloc
 	cbz	x0, Lan_fail
@@ -5564,7 +5610,7 @@ arena_new:
 	bl	_CMBlockBufferCreateWithMemoryBlock
 	cbnz	w0, Lan_free
 	str	x23, [x19, #ST_AR]
-	stp	x20, x21, [x19, #ST_ARPOS]
+	stp	x20, x24, [x19, #ST_ARPOS]
 	str	x22, [x19, #ST_ARCAP]
 	mov	x0, #1
 	b	Lret3
@@ -5576,6 +5622,16 @@ Lan_free:
 Lan_fail:
 	mov	x0, #0
 	b	Lret3
+
+ar_put:
+	ldr	x9, [x19, #ST_ARN]
+	add	x10, x9, x22
+	str	x10, [x19, #ST_ARN]
+	ldr	x0, [x19, #ST_AR]
+	add	x0, x0, x9
+	mov	x1, x20
+	mov	x2, x22
+	b	_memcpy
 
 ; st_keep -> x0 = the stream position of the earliest sample its tracks have not given yet (x19 = stream).
 st_keep:
@@ -5590,7 +5646,7 @@ st_keep:
 	mov	w11, #2
 1:	ldr	x12, [x10], #8
 	cbz	x12, 4f
-	cbz	w9, 2f
+	tbz	w9, #0, 2f
 	ldp	w13, w14, [x12, #TR_FN]
 	cmp	w14, w13
 	b.hs	4f
@@ -5602,6 +5658,12 @@ st_keep:
 2:	ldr	w13, [x12, #TR_I]
 	ldr	w14, [x12, #TR_N]
 	ldr	x15, [x12, #TR_OFF]
+	ldr	w16, [x12, #TR_CUR]
+	ldr	x1, [x12, #TR_XLP]
+	sub	x1, x1, #1
+	cmp	w16, #1
+	ccmp	x1, x15, #2, eq
+	csel	x15, x1, x15, lo
 	cmp	w13, w14
 	b.lo	3f
 	ldr	w13, [x12, #TR_MWAIT]     ; a Matroska or FLV cursor waiting for bytes: from where it reads on
@@ -5618,13 +5680,16 @@ emit:
 	FRAME	2
 	mov	x20, x0
 	ldr	w9, [x20, #ST_FRAG]
-	cbz	w9, Lem_whole
+	cbz	w9, Lxe_loop
+	tbnz	w9, #1, Lem_afs
 	add	x21, x20, #ST_TR
 	mov	w22, #2
 Lem_track:
 	ldr	x19, [x21], #8
 	cbz	x19, Lem_next
 Lem_sample:
+	bl	q_wait
+	b.hs	Lem_next
 	ldp	w9, w10, [x19, #TR_FN]
 	cmp	w10, w9
 	b.hs	Lem_next
@@ -5667,46 +5732,23 @@ Lem_next:
 	subs	w22, w22, #1
 	b.ne	Lem_track
 	b	Lret2
-Lem_whole:
-	mov	x19, #0                   ; the track whose next sample comes first in the file
-	mov	x9, #-1
-	ldr	x10, [x20, #ST_TR]
-	ldr	x11, [x20, #(ST_TR + 8)]
-	cbz	x10, 1f
-	ldr	w12, [x10, #TR_I]
-	ldr	w13, [x10, #TR_N]
-	cmp	w12, w13
-	b.hs	1f
-	ldr	x9, [x10, #TR_OFF]
-	mov	x19, x10
-1:	cbz	x11, 2f
-	ldr	w12, [x11, #TR_I]
-	ldr	w13, [x11, #TR_N]
-	cmp	w12, w13
-	b.hs	2f
-	ldr	x12, [x11, #TR_OFF]
-	cmp	x12, x9
-	b.hs	2f
-	mov	x19, x11
-2:	cbz	x19, Lret2
-	bl	cur_size
+Lem_afs:
+	ldr	x19, [x20, #ST_TR]
+1:	bl	q_wait
+	b.hs	Lret2
+	bl	xs_win
 	ldr	x9, [x19, #TR_OFF]
-	ldp	x14, x15, [x20, #ST_ARPOS]
-	subs	x9, x9, x14
-	b.lo	3f                        ; before the arena: gone
-	add	x9, x9, x0
-	cmp	x9, x15
-	b.hi	Lret2                     ; not all here yet
-	bl	aonly_drop
-	b.eq	3f                        ; Audio Only: not this picture
-	ldr	x0, [x20, #ST_ARBB]
-	mov	x1, x14
-	bl	cur_sample
-	cbz	x0, Lem_whole
-	bl	q_push
-	b	Lem_whole
-3:	bl	cur_step
-	b	Lem_whole
+	cmp	x1, x9
+	b.ls	2f
+	mov	x3, #16384
+	bl	Lafs_win
+	b	1b
+2:	ldr	x9, [x27, #E_DURMS]
+	cbnz	x9, Lret2
+	ldr	x9, [x19, #TR_FD]
+	cbz	x9, Lret2
+	bl	afs_dur
+	b	Lret2
 
 ; aonly_drop — flags eq when Audio Only drops the track's samples: it is the playing picture (x19 = track; x9, x10 only).
 aonly_drop:
@@ -5715,6 +5757,14 @@ aonly_drop:
 	cmp	x10, x19
 	ccmp	w9, #0, #4, eq
 	ccmp	w9, w9, #0, ne
+	ret
+
+q_wait:
+	ldp	w9, w10, [x19, #TR_FH]
+	sub	w9, w10, w9
+	ldr	w10, [x20, #ST_HUNGRY]
+	cmp	w9, #(FIFO_N - 16)
+	ccmp	wzr, w10, #0, hs
 	ret
 
 ; box_done(stream) -> w0 = 1 when reading the collected box moved the stream elsewhere.
@@ -5772,6 +5822,24 @@ Lbd_moov:
 	mov	w0, w20
 	b	Lret2
 
+mvhd_read:
+	mov	w10, #0
+	add	x9, x0, #32
+	cmp	x9, x1
+	b.hi	2f
+	ldrb	w9, [x0]                  ; version: 32- or 64-bit times
+	ldr	w10, [x0, #12]
+	ldr	w11, [x0, #16]
+	rev	w11, w11
+	cbz	w9, 1f
+	ldr	w10, [x0, #20]
+	ldr	x11, [x0, #24]
+	rev	x11, x11
+1:	rev	w10, w10                  ; movie timescale
+	cbz	w10, 2f
+	str	w10, [x27, #E_MTS]
+2:	ret
+
 ; on_moov(stream, moov, length) -> w0 = 1 if the stream moved: its tracks, each fed by this stream, the first of each kind playing.
 on_moov:
 	FRAME	4
@@ -5783,20 +5851,8 @@ on_moov:
 	TYPE	w2, 'm','v','h','d'
 	bl	box_find
 	cbz	x0, Lmv_traks
-	add	x9, x0, #32
-	cmp	x9, x1
-	b.hi	Lmv_traks
-	ldrb	w9, [x0]
-	ldr	w10, [x0, #12]
-	ldr	w11, [x0, #16]
-	rev	w11, w11
-	cbz	w9, 1f
-	ldr	w10, [x0, #20]
-	ldr	x11, [x0, #24]
-	rev	x11, x11
-1:	rev	w10, w10
+	bl	mvhd_read
 	cbz	w10, Lmv_traks
-	str	w10, [x27, #E_MTS]
 	ldr	x9, [x27, #E_DURMS]
 	cbnz	x9, Lmv_traks             ; YouTube said it
 	mov	x12, #1000
@@ -5893,12 +5949,6 @@ Lta_no:
 
 ; trk_aim — the track's target from the last seek's, in its units; the first of its kind plays (x19 = track).
 trk_aim:
-	ldr	x1, [x27, #E_TGTMS]
-	ldr	w9, [x19, #TR_TS]
-	mul	x1, x1, x9
-	mov	x9, #1000
-	udiv	x1, x1, x9
-	str	x1, [x19, #TR_TGT]
 	ldr	w9, [x19, #TR_KIND]
 	add	x10, x27, #((E_VT >> 12) << 12)
 	add	x10, x10, #(E_VT & 4095)
@@ -5910,7 +5960,14 @@ trk_aim:
 1:	ldr	x11, [x10]
 	cbnz	x11, 2f
 	str	x19, [x10]
-2:	ret
+2:	ldr	x1, [x27, #E_TGTMS]
+trk_tgt:
+	ldr	w9, [x19, #TR_TS]
+	mul	x1, x1, x9
+	mov	x9, #1000
+	udiv	x1, x1, x9
+	str	x1, [x19, #TR_TGT]
+	ret
 
 ; trk_new(stream, kind, timescale) -> x0 = a new track the stream feeds, or 0.
 trk_new:
@@ -6026,8 +6083,11 @@ Lmf_traf:
 	stp	w12, w13, [sp, #MF_DEF]
 	str	w14, [sp, #(MF_DEF + 8)]
 	stp	x15, x15, [sp, #MF_BASE]
+	ldp	w9, w10, [x19, #TR_FN]
+	subs	w26, w9, w10
+	b.ne	8f
 	stp	wzr, wzr, [x19, #TR_FN]   ; a new fragment's list
-	mov	x0, x24
+8:	mov	x0, x24
 	mov	x1, x25
 	TYPE	w2, 't','f','d','t'
 	bl	box_find
@@ -6041,8 +6101,9 @@ Lmf_traf:
 	cbz	w9, 1f
 	ldr	x10, [x0, #4]
 	rev	x10, x10
-1:	str	x10, [x19, #TR_FDTS]
-	ldr	w9, [x20, #ST_KIND]
+1:	cbnz	w26, 7f
+	str	x10, [x19, #TR_FDTS]
+7:	ldr	w9, [x20, #ST_KIND]
 	cbz	w9, 3f
 	ldr	w12, [x19, #TR_TS]        ; HLS: one timeline for every stream, anchored at the first decode time less its segment's start (90 kHz)
 	mov	x13, #(90000 & 0xffff)
@@ -6664,13 +6725,16 @@ st_get:
 	mov	w22, w2
 	mov	x23, x3
 	mov	x24, x4
+	mov	x21, x1
 	str	w2, [x19, #ST_REQT]
 	mov	x0, x1
 	bl	mkreq
-	cbz	x0, Lgt_fail
+	cbz	x0, Lpu_end
 	mov	x20, x0
 	cbnz	x24, 1f
-	cbnz	w22, Lgt_go               ; a whole text or segment
+	ldr	w9, [x19, #ST_LIVE]
+	orr	w9, w9, w22
+	cbnz	w9, Lgt_go                ; a whole text or segment
 	mov	x24, #CHUNK               ; a stream's bytes: googlevideo slows anything larger to real time
 	ldr	x11, [x19, #ST_LEN]
 	sub	x12, x11, x23
@@ -6686,18 +6750,15 @@ st_get:
 	bl	_snprintf
 	add	x0, sp, #GT_BUF
 	bl	mkstr
-	mov	x21, x0
+	mov	x23, x0
 	GADDR	x0, Ls_range
 	bl	mkstr
 	mov	x3, x0
-	mov	x2, x21
+	mov	x2, x23
 	mov	x0, x20
 	SEND	S_setValue_forHTTPHeaderField_
 Lgt_go:
-	mov	x0, x20
-	SEND	S_URL
-	SEND	S_absoluteString
-	SEND	S_UTF8String
+	mov	x0, x21
 	GADDR	x1, Ls_gvideo
 	bl	_strstr
 	cbz	x0, 2f
@@ -6710,19 +6771,15 @@ Lgt_go:
 	str	x20, [x19, #(ST_RQ + RQ_REQ)]
 	mov	w9, #1
 	str	w9, [x19, #ST_FETCH]
+	ldr	x9, [x19, #ST_SEGOFF]
 	str	xzr, [x19, #ST_GOT]
 	str	wzr, [x19, #ST_ANS]
-	str	xzr, [x19, #ST_SKIP]
+	str	x9, [x19, #ST_SKIP]
 	str	xzr, [x19, #ST_TXTN]
-	mov	w0, #CLOCK_UPTIME_RAW
-	bl	_clock_gettime_nsec_np
+	bl	now_ns
 	str	x0, [x19, #ST_T1]
 	add	x0, x19, #ST_RQ
 	bl	Lnet_start
-	b	Lret3
-Lgt_fail:
-	mov	x0, x19
-	bl	st_end
 	b	Lret3
 
 ; st_get_own(stream, url, type, first, length) — st_get with a URL (malloc) the stream keeps until its next request.
@@ -6789,6 +6846,7 @@ hexbyte:
 	.equ HP_SIZE,	HP_SEG + SG_SIZE
 hls_pump:
 	FRAME	3, HP_SIZE, 1
+Lhp_again:
 	ldr	x9, [x19, #ST_PL]
 	ldr	w10, [x19, #ST_STALE]
 	cmp	x9, #0
@@ -6805,7 +6863,7 @@ hls_pump:
 	cmp	x10, x9
 	b.lo	Lhp_behind
 	ldr	w9, [sp, #(HP_SEG + SG_END)]
-	cbnz	w9, Lhp_end
+	cbnz	w9, Lpu_end
 	mov	w9, #1                    ; live, not out yet: the playlist again in half a target duration
 	str	w9, [x19, #ST_STALE]
 	ldr	w0, [sp, #(HP_SEG + SG_TDUR)]
@@ -6814,19 +6872,14 @@ hls_pump:
 	b	Lret3
 Lhp_behind:
 	str	x9, [x19, #ST_SEQ]        ; out of the live window: its oldest
-	mov	x0, x19
-	bl	hls_pump
-	b	Lret3
-Lhp_end:
-	mov	x0, x19
-	bl	st_end
-	b	Lret3
+	b	Lhp_again
 Lhp_list:
 	ldr	x0, [x19, #ST_PLURL]
 	bl	_strdup
 	mov	x1, x0
 	mov	x0, x19
 	mov	w2, #1
+Lhp_whole:
 	mov	x3, #0
 	mov	x4, #0
 	bl	st_get_own
@@ -6834,11 +6887,7 @@ Lhp_list:
 Lhp_seg:
 	ldr	x9, [sp, #(HP_SEG + SG_T)]
 	str	x9, [x19, #ST_SEGT]
-	ldr	w9, [sp, #(HP_SEG + SG_DISC)]
-	cbz	w9, 1f
-	mov	x9, #-1                   ; a discontinuity: the timeline is anchored again
-	str	x9, [x27, #E_T0]
-1:	str	wzr, [x19, #ST_ENC]
+	str	wzr, [x19, #ST_ENC]
 	ldr	x20, [sp, #(HP_SEG + SG_KEY)]
 	cbz	x20, Lhp_map
 	mov	x0, x20                   ; AES-128: its key, fetched once
@@ -6862,10 +6911,7 @@ Lhp_seg:
 2:	mov	x0, x19
 	mov	x1, x22
 	mov	w2, #2
-	mov	x3, #0
-	mov	x4, #0
-	bl	st_get_own
-	b	Lret3
+	b	Lhp_whole
 3:	mov	x0, x22
 	bl	_free
 	mov	w9, #1
@@ -6939,13 +6985,19 @@ Lhp_map:
 6:	mov	x0, x22
 	bl	_free
 Lhp_get:
+	ldr	x9, [x19, #ST_SEGOFF]
+	cbnz	x9, 1f
 	str	wzr, [x19, #ST_SEGF]
-	mov	x0, x19
+	ldr	w9, [sp, #(HP_SEG + SG_DISC)]
+	cbz	w9, 2f
+	mov	x9, #-1                   ; a discontinuity: the timeline is anchored again
+	str	x9, [x27, #E_T0]
+2:	mov	x0, x19
 	bl	seg_reset
-	ldr	x0, [x19, #ST_PLURL]
+1:	ldr	x0, [x19, #ST_PLURL]
 	ldp	x1, x2, [sp, #(HP_SEG + SG_URI)]
 	bl	url_join
-	cbz	x0, Lhp_end
+	cbz	x0, Lpu_end
 	mov	x1, x0
 	mov	x0, x19
 	mov	w2, #3
@@ -6985,7 +7037,7 @@ Lht_list:
 	str	x0, [x27, #E_MURL]
 	str	xzr, [x19, #ST_RQURL]
 	bl	hls_pick
-	cbz	w0, Lht_end
+	cbz	w0, Lsd_end
 	ldr	w9, [x27, #(E_ST + ST_SIZE + ST_KIND)]
 	cbz	w9, Lht_pump              ; no sound rendition (a broadcast's DASH sound waits for Audio Only)
 	BADDR	x0, (E_ST + ST_SIZE)
@@ -7027,17 +7079,11 @@ Lht_media:
 	ldr	x9, [sp, #SG_SEQ]
 	str	x9, [x19, #ST_SEQ]
 Lht_pump:
-	mov	x0, x19
-	bl	st_pump
-	b	Lret2
+	b	Lsd_pump
 Lht_drop:
 	mov	x0, x20
 	bl	_free
 	b	Lht_pump
-Lht_end:
-	mov	x0, x19
-	bl	st_end
-	b	Lret2
 
 ; hls_done(stream, ok) — an HLS request ended: text read, a segment flushed (decrypted first) and timed for the bit rate, then the next.
 hls_done:
@@ -7080,8 +7126,7 @@ Lhd_seg:
 	BADDR	x10, E_ST
 	cmp	x19, x10
 	b.ne	Lhd_next                  ; the picture's stream times the network and picks the variant
-	mov	w0, #CLOCK_UPTIME_RAW     ; its speed, averaged into the estimate
-	bl	_clock_gettime_nsec_np
+	bl	now_ns                    ; its speed, averaged into the estimate
 	ldr	x9, [x19, #ST_T1]
 	sub	x9, x0, x9
 	cmp	x9, #1
@@ -7119,12 +7164,16 @@ Lhd_fail:
 	add	x9, x9, #1
 	str	x9, [x19, #ST_SEQ]
 	str	wzr, [x19, #ST_ERRS]
-	ldr	w9, [x19, #ST_REQT]
+	str	xzr, [x19, #ST_SEGOFF]
+	ldp	x9, x10, [x19, #ST_TR]
+	cbz	x9, 2f
+	stp	wzr, wzr, [x9, #TR_FN]
+2:	cbz	x10, 3f
+	stp	wzr, wzr, [x10, #TR_FN]
+3:	ldr	w9, [x19, #ST_REQT]
 	cmp	w9, #3
 	b.eq	Lhd_next
-	mov	x0, x19
-	bl	st_end
-	b	Lret3
+	b	Lpu_end
 
 ; seg_decrypt(stream) — decrypt the collected segment in place (AES-128-CBC, PKCS7) and read it.
 seg_decrypt:
@@ -8447,19 +8496,21 @@ Laf_no:
 
 ; afs_more -> w0 = 1 while the mapped file goes on: its next 64 KiB to the track's AudioFileStream, 0 at the end or for what it cannot read (x19 = track).
 afs_more:
+	ldr	x0, [x27, #E_MAP]
+	ldr	x1, [x27, #E_LEN]
+	mov	x3, #0x10000
+Lafs_win:
 	FRAME	0
 	ldr	x9, [x19, #TR_OFF]
-	ldr	x10, [x27, #E_LEN]
-	subs	x1, x10, x9
+	add	x2, x0, x9
+	subs	x1, x1, x9
 	b.ls	1f
-	mov	x11, #0x10000
-	cmp	x1, x11
-	csel	x1, x1, x11, ls
+	cmp	x1, x3
+	csel	x1, x1, x3, ls
 	add	x10, x9, x1
 	str	x10, [x19, #TR_OFF]
 	ldr	x0, [x19, #TR_AFS]
-	ldr	x2, [x27, #E_MAP]
-	add	x2, x2, x9
+	cbz	x0, 1f
 	mov	w3, #0                    ; no discontinuity flag: AudioFileStreamSeek placed it, and the flag stops WAV and AIFF
 	bl	_AudioFileStreamParseBytes
 	cmp	w0, #0
@@ -8588,32 +8639,14 @@ afs_stream:
 	bl	trk_new
 	cbz	x0, Lret1
 	str	xzr, [x0, #TR_APTS]
+	mov	w9, #2
+	str	w9, [x19, #ST_FRAG]
+	str	w9, [x19, #ST_XHEAD]
+	str	w9, [x0, #TR_N]
 	mov	w1, #0
 	bl	afs_open
 	mov	x0, x19
 	bl	no_pic
-	b	Lret1
-
-; afs_sfeed(stream, bytes, length) — a sound stream's bytes to its track's AudioFileStream; its length once it can tell.
-afs_sfeed:
-	FRAME	1
-	ldr	x9, [x0, #ST_SPOS]
-	add	x9, x9, x2
-	str	x9, [x0, #ST_SPOS]
-	ldr	x19, [x0, #ST_TR]
-	cbz	x19, Lret1
-	ldr	x9, [x19, #TR_OFF]        ; bytes read so far, for its length
-	add	x9, x9, x2
-	str	x9, [x19, #TR_OFF]
-	mov	x0, x19
-	mov	x3, #-1
-	bl	afs_feed
-	ldr	x9, [x27, #E_DURMS]
-	ldr	x10, [x19, #TR_FD]
-	cmp	x9, #0
-	ccmp	x10, #0, #4, eq
-	b.eq	Lret1
-	bl	afs_dur
 	b	Lret1
 
 ; no_pic(stream) — the media's first stream has no picture: the clock waits for none.
@@ -8636,7 +8669,8 @@ afs_open:
 
 ; afs_feed(track, bytes, length, pts) — bytes for its AudioFileStream; pts (track units, after the timeline's shift) times the packets that follow, -1 to go on.
 afs_feed:
-	tbnz	x3, #63, 1f
+	cmn	x3, #1
+	b.eq	1f
 	str	x3, [x0, #TR_APTS]
 1:	mov	w3, #0
 	ldr	x0, [x0, #TR_AFS]
@@ -8775,11 +8809,14 @@ afs_feed:
 	ldr	w9, [x19, #TR_AFPP]       ; their length: packets x frames x timescale / rate
 	umull	x9, w9, w21
 	ldr	w10, [x19, #TR_TS]
-	mul	x9, x9, x10
+	ldr	x11, [x19, #TR_AREM]
+	madd	x9, x9, x10, x11
 	ldr	w10, [x19, #TR_ASR]
 	cmp	w10, #0
 	csinc	w10, w10, wzr, ne
 	udiv	x23, x9, x10
+	msub	x11, x23, x10, x9
+	str	x11, [x19, #TR_AREM]
 	add	x9, x22, x23
 	str	x9, [x19, #TR_APTS]
 	str	x22, [x19, #TR_LAST]
@@ -8823,7 +8860,9 @@ pa_feed:
 	mov	x21, x2
 	mov	x23, #-1                  ; no time: the packets go on
 	ldr	x9, [x19, #ST_GOT]
+	ldr	x10, [x19, #ST_SEGOFF]
 	cmp	x9, x21
+	ccmp	x10, #0, #0, eq
 	b.ne	Lpa_feed                  ; not the segment's first bytes
 	ldrb	w9, [x20]
 	cmp	w9, #'I'
@@ -8874,7 +8913,8 @@ Lpa_feed:
 	cbz	x0, Lret3
 	ldr	x9, [x0, #TR_APTS]        ; no time stamp and none yet (a start or a seek): its segment's start
 	and	x9, x9, x23
-	tbz	x9, #63, 3f
+	cmn	x9, #1
+	b.ne	3f
 	ldr	x23, [x19, #ST_SEGT]
 	mov	x9, #90
 	mul	x23, x23, x9
@@ -8903,7 +8943,7 @@ id3_pts:
 	csel	x20, x22, x20, lo
 	add	x20, x19, x20             ; where the frames end
 	add	x19, x19, #10
-1:	add	x9, x19, #64
+1:	add	x9, x19, #63
 	cmp	x9, x20
 	b.hi	3f
 	ldr	w9, [x19]
@@ -9339,20 +9379,8 @@ Lmo_go:
 	TYPE	w2, 'm','v','h','d'
 	bl	box_find
 	cbz	x0, Lnil4
-	add	x9, x0, #32
-	cmp	x9, x1
-	b.hi	Lnil4
-	ldrb	w9, [x0]                  ; version: 32- or 64-bit times
-	ldr	w10, [x0, #12]
-	ldr	w11, [x0, #16]
-	rev	w11, w11
-	cbz	w9, 1f
-	ldr	w10, [x0, #20]
-	ldr	x11, [x0, #24]
-	rev	x11, x11
-1:	rev	w10, w10                  ; movie timescale
+	bl	mvhd_read
 	cbz	w10, Lnil4
-	str	w10, [x27, #E_MTS]
 	mov	x12, #1000
 	mul	x11, x11, x12
 	udiv	x11, x11, x10
@@ -9430,6 +9458,17 @@ Lsf_own:
 	CALLF	CMAudioFormatDescriptionCreate
 	ldr	x0, [x19, #TR_FD]
 	b	Lret1
+box_v1:
+	add	x9, x0, #24
+	cmp	x9, x1
+	b.hi	2f
+	ldrb	w9, [x0]
+	ldr	w10, [x0, #12]
+	cbz	w9, 1f
+	ldr	w10, [x0, #20]
+1:	rev	w10, w10
+2:	ret
+
 ; trak_open(trak, end, fragmented, track) -> x0 = the track (the next free one if 0), read: kind, timescale, edit, tables (empty when fragmented) and format; 0 for one this player cannot use.
 trak_open:
 	FRAME	4
@@ -9448,14 +9487,8 @@ trak_open:
 1:	TYPE	w2, 't','k','h','d'
 	bl	box_find
 	cbz	x0, Lnil4
-	add	x9, x0, #24
-	cmp	x9, x1
+	bl	box_v1
 	b.hi	Lnil4
-	ldrb	w9, [x0]
-	ldr	w10, [x0, #12]
-	cbz	w9, 1f
-	ldr	w10, [x0, #20]
-1:	rev	w10, w10
 	str	w10, [x19, #TR_ID]
 	add	x11, x0, #40              ; its matrix's first column: the turn
 	cbz	w9, 2f
@@ -9494,14 +9527,8 @@ trak_open:
 	TYPE	w2, 'm','d','h','d'
 	bl	box_find
 	cbz	x0, Lnil4
-	add	x9, x0, #24
-	cmp	x9, x1
+	bl	box_v1
 	b.hi	Lnil4
-	ldrb	w9, [x0]
-	ldr	w10, [x0, #12]
-	cbz	w9, 1f
-	ldr	w10, [x0, #20]
-1:	rev	w10, w10
 	cbz	w10, Lnil4
 	str	w10, [x19, #TR_TS]
 	add	x11, x0, #20              ; its language: three letters, 5 bits each
@@ -10365,6 +10392,9 @@ Lpd_empty:
 	str	w9, [x19, #TR_STARVE]     ; the next sample asks the renderer again
 	ldr	x0, [x19, #TR_ST]
 	bl	st_pump
+	ldp	w9, w10, [x19, #TR_FH]
+	cmp	w9, w10
+	b.ne	Lpd_pop
 Lpd_none:
 	mov	x0, #0
 	b	Lret1
@@ -10477,24 +10507,14 @@ trk_play:
 	SEND	S_stopRequestingMediaData
 	mov	x0, x20
 	SEND	S_flush
-	ldr	w9, [x19, #TR_TS]
-	mul	x0, x22, x9
-	mov	x9, #1000
-	udiv	x0, x0, x9                ; the moment, in track units
-	str	x0, [x19, #TR_TGT]
-	ldr	x9, [x19, #TR_SHIFT]
-	add	x0, x0, x9                ; and in the media's own time
-	ldr	w9, [x19, #TR_KIND]
-	mov	w1, #1
-	cmp	w9, #'a'
-	b.ne	1f
-	mov	w1, #(1 + AUDIO_PREROLL)
+	mov	x1, x22
+	bl	trk_tgt
 	ldr	x9, [x19, #TR_AFS]
 	cbz	x9, 1f
 	mov	x0, x22                   ; a sound file
 	bl	afs_seek
 	b	2f
-1:	bl	cur_seek
+1:	bl	trk_seek
 2:	mov	x0, x20
 	ldr	x2, [x28, #G_MEDIAQ]
 	mov	x3, x21
@@ -11284,17 +11304,20 @@ Lp_eaonly:
 	b.ne	Lret2                     ; other media now: no more ticks
 	bl	now_ms
 	mov	x20, x0                   ; the clock, ms
-	mov	x21, #0x7fffffffffffffff
+	ldr	x0, [x27, #E_SUBT]
+	bl	nt_feed
+	ldr	x9, [x27, #E_VT]
+	ldr	x10, [x27, #E_AT]
+	orr	x9, x9, x10
+	cmp	x9, #0
+	csetm	x21, ne
+	lsr	x21, x21, #1
 	ldr	w9, [x28, #G_AONLY]
 	cbnz	w9, 1f
 	ldr	x0, [x27, #E_VT]
-	bl	ahead_ms
-	cmp	x0, x21
-	csel	x21, x0, x21, lt
+	bl	nt_feed
 1:	ldr	x0, [x27, #E_AT]
-	bl	ahead_ms
-	cmp	x0, x21
-	csel	x21, x0, x21, lt          ; the least time queued ahead
+	bl	nt_feed
 	ldr	w9, [x27, #E_HOLD]
 	tbnz	w9, #1, Lnt_dry
 	ldr	w10, [x28, #G_PLAYING]
@@ -11356,6 +11379,18 @@ Ltick_shift:
 	mov	w2, w19
 	adr	x3, net_tick
 	bl	_dispatch_after_f
+	b	Lret1
+
+nt_feed:
+	FRAME	1
+	mov	x19, x0
+	cbz	x19, 1f
+	ldr	x0, [x19, #TR_ST]
+	bl	st_pump
+1:	mov	x0, x19
+	bl	ahead_ms
+	cmp	x0, x21
+	csel	x21, x0, x21, lt          ; the least time queued ahead
 	b	Lret1
 
 ; ahead_ms(track) -> x0 = ms of it queued past the clock (x20, ms); a large number with nothing more to come.
@@ -14783,9 +14818,7 @@ xs_est:
 	str	w14, [x19, #TR_MDDUR]
 1:	ret
 
-; mkv_start(moment) — the cursor at the track's first frame in the cluster its index gives for that moment (track units; sound looks 200 ms earlier, for its preroll), a picture's at its first sync frame (x19 = track).
-mkv_start:
-	FRAME	4, 48
+xs_moment:
 	mov	x22, x0
 	ldr	w9, [x19, #TR_KIND]
 	cmp	w9, #'a'
@@ -14798,6 +14831,12 @@ mkv_start:
 1:	scvtf	d0, x22
 	ldr	d1, [x19, #TR_MFAC]
 	fdiv	d0, d0, d1
+	ret
+
+; mkv_start(moment) — the cursor at the track's first frame in the cluster its index gives for that moment (track units; sound looks 200 ms earlier, for its preroll), a picture's at its first sync frame (x19 = track).
+mkv_start:
+	FRAME	4, 48
+	bl	xs_moment
 	fcvtzs	x22, d0                   ; the moment in ticks
 	mov	x9, #-1
 	str	x9, [sp, #32]
@@ -16280,18 +16319,7 @@ Lfn_edge:
 ; flv_start(moment) — the cursor at the track's first frame from the tag its index gives for that moment, or that halving the file finds (track units; sound looks 200 ms earlier), a picture's at its first sync frame (x19 = track).
 flv_start:
 	FRAME	4
-	mov	x22, x0
-	ldr	w9, [x19, #TR_KIND]
-	cmp	w9, #'a'
-	b.ne	1f
-	ldr	w10, [x19, #TR_TS]
-	mov	w11, #5
-	udiv	w10, w10, w11
-	subs	x22, x22, x10
-	csel	x22, x22, xzr, ge
-1:	scvtf	d0, x22
-	ldr	d1, [x19, #TR_MFAC]
-	fdiv	d0, d0, d1
+	bl	xs_moment
 	fcvtzs	x22, d0                   ; the moment, ms
 	bl	xs_win
 	mov	x20, x0
@@ -16446,8 +16474,6 @@ xs_sink:
 Lxk_more:
 	cbz	x21, Lret3
 	ldp	x9, x10, [x19, #ST_ARN]   ; used, room
-	ldr	x11, [x19, #ST_AR]
-	cbz	x11, 1f
 	cmp	x9, x10
 	b.lo	2f
 	ldr	w12, [x19, #ST_XHEAD]
@@ -16464,14 +16490,7 @@ Lxk_more:
 2:	sub	x10, x10, x9
 	cmp	x21, x10
 	csel	x22, x21, x10, lo
-	ldr	x0, [x19, #ST_AR]
-	add	x0, x0, x9
-	mov	x1, x20
-	mov	x2, x22
-	bl	_memcpy
-	ldr	x9, [x19, #ST_ARN]
-	add	x9, x9, x22
-	str	x9, [x19, #ST_ARN]
+	bl	ar_put
 	ldr	x9, [x19, #ST_SPOS]
 	add	x9, x9, x22
 	str	x9, [x19, #ST_SPOS]
@@ -16485,16 +16504,14 @@ Lxk_more:
 	b.lt	4f
 	b.ne	Lret3                     ; it moved: the rest is not wanted
 3:	mov	x0, x19
-	bl	xs_emit
+	bl	emit
 	b	Lxk_more
 4:	cbz	w0, Lxk_fail              ; -1: more first
 	b	Lxk_more
 Lxk_fail:
 	mov	x0, x19                   ; not playable: AVPlayer gets it
 	bl	st_reset
-	mov	x0, x19
-	bl	st_end
-	b	Lret3
+	b	Lpu_end
 Lxk_cues:
 	ldr	x0, [x19, #ST_XIDX]       ; the Cues as they come, until their element is whole
 	ldr	x22, [x19, #ST_XIDXN]
@@ -16571,10 +16588,6 @@ xs_head:
 	mov	w0, #2
 	b	Lret1
 
-; xs_emit(stream) — its frames all in, in file order, to their tracks' queues; a cursor that waited for bytes reads on first.
-xs_emit:
-	FRAME	2, 0, 1
-	mov	x20, x19
 Lxe_loop:
 	mov	x21, #0                   ; the track whose frame comes first in the file
 	mov	x22, #-1
@@ -16584,10 +16597,16 @@ Lxe_loop:
 	bl	Lxe_one
 	cbz	x21, Lret2
 	mov	x19, x21
+	bl	cur_size
+	ldp	x1, x9, [x20, #ST_ARPOS]
+	subs	x10, x22, x1
+	b.lo	1f
+	add	x10, x10, x0
+	cmp	x10, x9
+	b.hi	Lret2
 	bl	aonly_drop
 	b.eq	1f
 	ldr	x0, [x20, #ST_ARBB]
-	ldr	x1, [x20, #ST_ARPOS]
 	bl	cur_sample
 	cbz	x0, Lxe_loop
 	bl	q_push
@@ -16601,17 +16620,24 @@ Lxe_one:
 	ldr	w9, [x19, #TR_MWAIT]
 	cbz	w9, 1f
 	bl	xs_step
-1:	ldp	x29, x30, [sp], #16
+1:	bl	q_wait
+	ldp	x29, x30, [sp], #16
+	b.hs	2f
 	ldr	w9, [x19, #TR_I]
 	ldr	w10, [x19, #TR_N]
 	cmp	w9, w10
-	b.hs	2f
+	b.hs	3f
 	ldr	x9, [x19, #TR_OFF]
 	cmp	x9, x22
 	b.hs	2f
 	mov	x21, x19
 	mov	x22, x9
 2:	ret
+3:	ldr	w9, [x19, #TR_MWAIT]
+	cbnz	w9, 2b
+	mov	x9, #(1 << 52)
+	str	x9, [x19, #TR_LAST]
+	ret
 
 ; xs_cursors(stream) -> x0 = where the stream reads from: its tracks' cursors at their targets, the earliest of them (0 with none).
 xs_cursors:
