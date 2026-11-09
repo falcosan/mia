@@ -806,7 +806,8 @@ Lc\@:	.asciz	"\text"
 .equ ST_PAUSEAT,                 ST_HUNGRY + 8
 .equ ST_SEGOFF,                  ST_PAUSEAT + 8
 .equ ST_KEYURL,                  ST_SEGOFF + 8 ; char*: the key in ST_KEY
-.equ ST_SIZE,                    ST_KEYURL + 8
+.equ ST_T0,                      ST_KEYURL + 8
+.equ ST_SIZE,                    ST_T0 + 8
 
 ; Track: title, artist and artwork URL.
 .equ T_TITLE,                    0        ; char[512]
@@ -6073,15 +6074,13 @@ Lmf_traf:
 	ldr	w12, [x19, #TR_TS]        ; HLS: one timeline for every stream, anchored at the first decode time less its segment's start (90 kHz)
 	mov	x13, #(90000 & 0xffff)
 	movk	x13, #(90000 >> 16), lsl #16
-	ldr	x11, [x27, #E_T0]
-	tbz	x11, #63, 2f
 	mul	x14, x10, x13
 	udiv	x14, x14, x12
-	ldr	x15, [x20, #ST_SEGT]
-	mov	x16, #90
-	msub	x11, x15, x16, x14
-	str	x11, [x27, #E_T0]
-2:	mul	x14, x11, x12
+	mov	x0, x14
+	mov	x1, x20
+	bl	t33_time
+	sub	x11, x14, x0
+	mul	x14, x11, x12
 	sdiv	x14, x14, x13
 	str	x14, [x19, #TR_SHIFT]
 Lmf_runs:
@@ -6957,9 +6956,9 @@ Lhp_get:
 	str	wzr, [x19, #ST_SEGF]
 	ldr	w9, [sp, #(HP_SEG + SG_DISC)]
 	cbz	w9, 2f
-	ldr	x9, [x27, #E_T0]          ; a discontinuity: the timeline is anchored again
-	orr	x9, x9, #(1 << 63)
-	str	x9, [x27, #E_T0]
+	ldr	x9, [sp, #(HP_SEG + SG_SEQ)] ; a discontinuity: the timeline is anchored again
+	ubfiz	x9, x9, #33, #30
+	str	x9, [x19, #ST_T0]
 2:	mov	x0, x19
 	bl	seg_reset
 1:	ldr	x0, [x19, #ST_PLURL]
@@ -7242,28 +7241,24 @@ vtt_cues:
 	mov	x21, x0
 	strb	wzr, [x21, x22]
 	cbz	x19, Lvc_free
-	mov	x23, #0                   ; its cues' offset on the timeline, ms
 	mov	x0, x21
 	CSTR	x1, "MPEGTS:"
 	bl	_strstr
 	cbz	x0, 1f
 	add	x0, x0, #7
 	bl	strtol10
+1:	ldr	x9, [x27, #E_T0]
+	sub	x0, x0, x9
 	mov	x9, #90
-	sdiv	x23, x0, x9
-1:	mov	x0, x21
+	sdiv	x23, x0, x9               ; its cues' offset on the timeline, ms
+	mov	x0, x21
 	CSTR	x1, "LOCAL:"
 	bl	_strstr
 	cbz	x0, 2f
 	add	x0, x0, #6
 	bl	vtt_time
 	sub	x23, x23, x0
-2:	ldr	x9, [x27, #E_T0]
-	sbfx	x9, x9, #0, #63
-	mov	x10, #90
-	sdiv	x9, x9, x10
-	sub	x23, x23, x9
-	mov	x24, x21
+2:	mov	x24, x21
 Lvc_cue:
 	mov	x0, x24
 	CSTR	x1, "-->"
@@ -7334,6 +7329,18 @@ Lvc_cue:
 	mov	x1, #0
 	add	x2, x22, #2
 	add	x4, x26, x23
+	ldr	x10, [x20, #ST_SEGT]
+	ldr	x11, [x27, #(E_ST + ST_SEGT)]
+	cmp	x10, x11
+	csel	x10, x10, x11, gt
+	ldr	w11, [x20, #ST_TDUR]
+	add	x10, x10, w11, uxtw #1
+	sub	x4, x4, x10
+	mov	x9, #90
+	mul	x4, x4, x9
+	orr	x4, x4, #~((1 << 33) - 1)
+	sdiv	x4, x4, x9
+	add	x4, x4, x10
 	mov	x3, x4
 	ldr	x5, [sp, #VC_DUR]
 	mov	w6, #1
@@ -7715,7 +7722,7 @@ Lba_lost:
 
 ; pes_done(stream, sound) — read a gathered PES: its times, anchored on the HLS timeline, then its picture or sound.
 pes_done:
-	FRAME	4, 0, 1
+	FRAME	3, 0, 1
 	mov	w22, w1
 	add	x23, x19, #ST_VPES
 	cbz	w22, 1f
@@ -7723,70 +7730,68 @@ pes_done:
 1:	ldp	x20, x21, [x23]
 	str	xzr, [x23, #8]
 	cmp	x21, #14
-	b.lo	Lret4
+	b.lo	Lret3
 	ldr	w9, [x20]
 	and	w9, w9, #0xffffff
 	cmp	w9, #0x10000              ; 00 00 01
-	b.ne	Lret4
+	b.ne	Lret3
 	ldrb	w9, [x20, #7]             ; PTS, DTS flags
 	ldrb	w10, [x20, #8]
 	add	x24, x10, #9              ; the payload
 	cmp	x24, x21
-	b.hs	Lret4
-	mov	x25, #-1                  ; untimed: a picture's goes on the waiting unit
+	b.hs	Lret3
+	mov	x3, #-1                   ; untimed: a picture's goes on the waiting unit
 	tbz	w9, #7, Lpz_cont
 	add	x0, x20, #9
-	bl	pts33
-	mov	x25, x0
-	mov	x26, x0
-	tbz	w9, #6, 2f
+	mov	x1, x19
+	bl	pts_time
+	mov	x3, x0
+	mov	x4, x0
+	tbz	w9, #6, Lpz_go
 	add	x0, x20, #14
-	bl	pts33
-	mov	x26, x0
-2:	ldr	x9, [x27, #E_T0]          ; the timeline: the first PTS less its segment's start
-	tbz	x9, #63, 3f
-	ldr	x10, [x19, #ST_SEGT]
-	mov	x11, #90
-	msub	x9, x10, x11, x25
-	str	x9, [x27, #E_T0]
-3:	sub	x25, x25, x9
-	sub	x26, x26, x9
+	bl	pts_time
+	mov	x4, x0
+Lpz_go:
 	ldr	x0, [x19, #ST_VT]
 	cbz	w22, 4f
 	ldr	x0, [x19, #ST_AT]
-4:	cbz	x0, Lret4
+4:	cbz	x0, Lret3
 	add	x1, x20, x24
 	sub	x2, x21, x24
-	mov	x3, x25
-	mov	x4, x26
 	cbnz	w22, 5f
 	bl	vau_next
-	b	Lret4
+	b	Lret3
 Lpz_cont:
-	cbnz	w22, Lret4
-	ldr	x0, [x19, #ST_VT]
-	cbz	x0, Lret4
-	add	x1, x20, x24
-	sub	x2, x21, x24
-	mov	x3, x25
-	bl	vau_next
-	b	Lret4
+	cbnz	w22, Lret3
+	b	Lpz_go
 5:	bl	afs_feed
-	b	Lret4
+	b	Lret3
 
-; pts33(p) -> x0 = a PES time stamp's 33 bits (x0 in; w9 kept).
-pts33:
-	ldrb	w10, [x0]
-	ubfx	w10, w10, #1, #3
-	ldrh	w11, [x0, #1]
-	rev16	w11, w11
-	lsr	w11, w11, #1
-	ldrh	w12, [x0, #3]
-	rev16	w12, w12
-	lsr	w12, w12, #1
-	lsl	x10, x10, #30
-	orr	x10, x10, x11, lsl #15
-	orr	x0, x10, x12
+pts_time:
+	ldr	x10, [x0]
+	rev	x10, x10
+	lsr	x0, x10, #27
+	bfxil	x0, x10, #26, #30
+	bfxil	x0, x10, #25, #15
+t33_time:
+	ldr	x10, [x1, #ST_SEGT]
+	mov	x11, #90
+	mul	x10, x10, x11
+	sub	x0, x0, x10
+	ldr	x11, [x1, #ST_T0]
+	tbnz	x11, #63, 2f
+	ldr	x2, [x27, #E_T0]
+	eor	x2, x2, x11
+	tst	x2, #~((1 << 33) - 1)
+	eor	x2, x2, x11
+	bfxil	x11, x0, #0, #33
+	csel	x11, x2, x11, eq
+	str	x11, [x27, #E_T0]
+	orr	x11, x11, #(1 << 63)
+	str	x11, [x1, #ST_T0]
+2:	sub	x0, x0, x11
+	sbfx	x0, x0, #0, #33
+	add	x0, x0, x10
 	ret
 
 ; next_sc(p, end) -> x0 = the next 00 00 01 at or after p, or end: 16 bytes at a time while none of them is zero.
@@ -8876,13 +8881,10 @@ pa_feed:
 	add	x20, x20, x0              ; past the tag
 	sub	x21, x21, x0
 	tbnz	x1, #63, Lpa_track
-	ldr	x9, [x27, #E_T0]          ; the timeline: anchored at the first time stamp
-	tbz	x9, #63, 1f
-	ldr	x10, [x19, #ST_SEGT]
-	mov	x11, #90
-	msub	x9, x10, x11, x1
-	str	x9, [x27, #E_T0]
-1:	sub	x23, x1, x9
+	mov	x0, x1
+	mov	x1, x19
+	bl	t33_time
+	mov	x23, x0
 Lpa_track:
 	ldr	x22, [x19, #ST_AT]
 	cbnz	x22, Lpa_feed
