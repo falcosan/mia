@@ -747,7 +747,7 @@ Lc\@:	.asciz	"\text"
 .equ ST_ARCAP,                   120
 .equ ST_MDEND,                   128      ; where the media data ends
 .equ ST_TR,                      136      ; the tracks it feeds (2)
-.equ ST_SQ,                      152      ; a live stream's next segment
+.equ ST_PLOFF,                   152
 .equ ST_PEND,                    160      ; a seek waiting for the index, ms, or -1
 .equ ST_GOT,                     168      ; bytes the running request gave
 .equ ST_PST,                     176      ; w: 0 box header, 1 box to collect, 2 media data, 3 to skip
@@ -757,7 +757,6 @@ Lc\@:	.asciz	"\text"
 .equ ST_FETCH,                   204      ; w: a request runs
 .equ ST_EOS,                     208      ; w: no more bytes
 .equ ST_ERRS,                    212      ; w: failures in a row
-.equ ST_LIVE,                    216      ; w: live, by segment number
 .equ ST_FRAG,                    220      ; w: fragmented: samples come from moof boxes
 .equ ST_RETRY,                   224      ; w: a retry is scheduled
 .equ ST_ANS,                     228      ; w: the running request's answer was checked
@@ -770,8 +769,8 @@ Lc\@:	.asciz	"\text"
 .equ ST_PLURL,                   328      ; char*: the media playlist's URL
 .equ ST_PL,                      336      ; char*: its text
 .equ ST_SEQ,                     344      ; the next segment's media sequence number
-.equ ST_SEGT,                    352      ; its start, ms
-.equ ST_KEYURL,                  360      ; char*: the key in ST_KEY
+.equ ST_SEGN,                    352
+.equ ST_SEGT,                    360      ; its start, ms
 .equ ST_MAPURL,                  368      ; char*: the init segment read
 .equ ST_T1,                      376      ; when the segment's request started, ns
 .equ ST_SEGF,                    384      ; w: the segment's format: 0 unknown, 1 TS, 2 boxes, 3 packed audio
@@ -806,7 +805,8 @@ Lc\@:	.asciz	"\text"
 .equ ST_HUNGRY,                  ST_XLEN + 8
 .equ ST_PAUSEAT,                 ST_HUNGRY + 8
 .equ ST_SEGOFF,                  ST_PAUSEAT + 8
-.equ ST_SIZE,                    ST_SEGOFF + 8
+.equ ST_KEYURL,                  ST_SEGOFF + 8 ; char*: the key in ST_KEY
+.equ ST_SIZE,                    ST_KEYURL + 8
 
 ; Track: title, artist and artwork URL.
 .equ T_TITLE,                    0        ; char[512]
@@ -1507,7 +1507,7 @@ _\name:
 .equ E_MURL,                     E_MASTER + 8
 .equ E_BPS,                      E_MURL + 8 ; the measured network speed, bits per second
 .equ E_FIRSTMS,                  E_BPS + 8 ; the first picture shown after a seek, ms (+1), 0 none yet; bit 63: ready on a poll already
-.equ E_LIVE,                     E_FIRSTMS + 8 ; w: a YouTube broadcast: Audio Only swaps its streams
+.equ E_LIVE,                     E_FIRSTMS + 8 ; w: a YouTube broadcast
 .equ E_PREV,                     E_LIVE + 4 ; w: a stream's seek showed its first picture already
 .equ E_SUBT,                     E_LIVE + 8 ; the subtitle track shown, 0 none
 .equ E_SUBN,                     E_SUBT + 8 ; its next cue, taken early (retained)
@@ -1526,7 +1526,9 @@ _\name:
 .equ CC_Q,                       CC_QN + 8
 .equ CC_E,                       32
 .equ CC_SIZE,                    CC_Q + 6 * CC_E
-.equ E_ST,                       (E_CC + CC_SIZE + 63) & ~63 ; Stream[STREAMS]
+.equ E_MSEQ,                     (E_CC + CC_SIZE + 7) & ~7
+.equ E_MTIME,                    E_MSEQ + 8
+.equ E_ST,                       (E_MTIME + 8 + 63) & ~63 ; Stream[STREAMS]
 .equ E_TR,                       (E_ST + STREAMS * ST_SIZE + 63) & ~63 ; Track[TRACKS]
 .equ E_CLRN,                     E_TR + TRACKS * TR_SIZE - E_CLR
 .equ B_RQT,                      E_TR + TRACKS * TR_SIZE ; {task, record}[RQS]: requests running (media queue)
@@ -4757,10 +4759,8 @@ fetch:
 ; ---- Streams: media over the network, parsed as it arrives (media queue) ----
 
 ; st_pump(stream) — ask for its next bytes, unless a request runs, it ended, or every track it feeds has enough queued.
-	.equ SP_URL,	16                ; char[4200]: a live segment's URL
-	.equ SP_SIZE,	4224
 st_pump:
-	FRAME	3, SP_SIZE, 1
+	FRAME	3, 0, 1
 	cbz	x19, Lret3
 	ldr	x9, [x19, #ST_URL]
 	ldr	x10, [x19, #ST_PLURL]
@@ -4867,17 +4867,6 @@ Ls_suspend:
 	cmp	x9, x10
 	b.hs	Lpu_end
 1:	ldr	x1, [x19, #ST_URL]
-	ldr	w9, [x19, #ST_LIVE]
-	cbz	w9, Lpu_req
-	ldr	x9, [x19, #ST_SQ]
-	cbz	x9, Lpu_req               ; the first asks for the newest segment
-	stp	x1, x9, [sp]
-	add	x0, sp, #SP_URL
-	mov	x1, #4200
-	CSTR	x2, "%s&sq=%ld"
-	bl	_snprintf
-	add	x1, sp, #SP_URL
-Lpu_req:
 	mov	x0, x19
 	mov	w2, #0
 	ldr	x3, [x19, #ST_POS]
@@ -5046,11 +5035,9 @@ st_done:
 	str	wzr, [x19, #ST_FETCH]
 	ldr	w9, [x19, #ST_REQT]
 	ldr	x10, [x19, #ST_TXTN]
-	ldr	w11, [x19, #ST_LIVE]
 	cmp	w9, #3
 	ccmp	x10, #0, #0, eq
-	ccmp	w11, #0, #0, ne
-	b.eq	6f
+	b.ne	6f
 	ldr	x9, [x19, #ST_GOT]
 	cbz	x9, 8f
 	str	wzr, [x19, #ST_ERRS]
@@ -5069,7 +5056,6 @@ st_done:
 	bl	hls_done
 	b	Lret2
 1:
-	cbnz	w11, Lsd_live
 	ldp	x9, x10, [x19, #ST_POS]   ; ST_POS, and the parsed position
 	ldr	x11, [x19, #ST_GOT]
 	add	x9, x9, x11
@@ -5108,30 +5094,6 @@ Lsd_pump:
 	mov	x0, x19
 	bl	st_pump
 	b	Lret2
-Lsd_live:
-	ldr	x9, [x19, #ST_SQ]
-	cbnz	x9, Lsd_seg
-	mov	x0, x21                   ; the newest segment's number: the next is after it
-	SEND	S_response
-	mov	x22, x0
-	CSTR	x0, "X-Sequence-Num"
-	bl	mkstr
-	mov	x2, x0
-	mov	x0, x22
-	SEND	S_valueForHTTPHeaderField_
-	SEND	S_UTF8String
-	cbz	x0, Lsd_nosq
-	bl	strtol10
-	mov	x9, x0
-	str	x0, [x19, #ST_SQ]
-Lsd_seg:
-	cbz	w20, Lsd_fail
-	str	wzr, [x19, #ST_ERRS]
-	ldr	x10, [x19, #ST_GOT]
-	cbz	x10, Lsd_later            ; not out yet
-	add	x9, x9, #1
-	str	x9, [x19, #ST_SQ]
-	b	Lsd_pump
 Lsd_fail:
 	mov	x0, x21
 	SEND	S_response
@@ -5144,13 +5106,10 @@ Lsd_fail:
 	str	w9, [x19, #ST_ERRS]
 	cmp	w9, #NET_TRIES
 	b.hs	Lsd_end
-Lsd_later:
 	mov	w0, #(RETRY_NS / 500000)
 	mov	x1, x19
 	bl	st_later
 	b	Lret2
-Lsd_nosq:
-	cbz	w20, Lsd_fail
 Lsd_end:
 	mov	x0, x19
 	bl	st_end
@@ -5248,11 +5207,13 @@ Lsk_rew:
 	str	w9, [x19, #ST_PST]
 	b	Lsk_go
 Lsk_hls:
-	str	xzr, [x19, #ST_SEQ]       ; HLS: the segment from the playlist, or when it comes
+	stp	xzr, xzr, [x19, #ST_SEQ]  ; HLS: the segment from the playlist, or when it comes
 	mov	x0, x19
 	bl	seg_reset
 	ldr	x9, [x19, #ST_PL]
 	cbz	x9, Lsk_hgo
+	ldr	w10, [x19, #ST_ENDED]
+	cbz	w10, Lsk_stale
 	mov	x0, x19
 	mov	w1, #1
 	mov	x2, x20
@@ -5270,6 +5231,10 @@ Lsk_hls:
 Lsk_hgo:
 	str	wzr, [x19, #ST_EOS]
 	b	Lhd_next
+Lsk_stale:
+	mov	w9, #1
+	str	w9, [x19, #ST_STALE]
+	b	Lsk_hgo
 Lsk_afs:
 	ldr	x0, [x19, #ST_TR]         ; sound: from AudioFileStream's byte for the moment
 	cbz	x0, Lsk_top
@@ -6104,7 +6069,7 @@ Lmf_traf:
 1:	cbnz	w26, 7f
 	str	x10, [x19, #TR_FDTS]
 7:	ldr	w9, [x20, #ST_KIND]
-	cbz	w9, 3f
+	cbz	w9, Lmf_runs
 	ldr	w12, [x19, #TR_TS]        ; HLS: one timeline for every stream, anchored at the first decode time less its segment's start (90 kHz)
 	mov	x13, #(90000 & 0xffff)
 	movk	x13, #(90000 >> 16), lsl #16
@@ -6119,12 +6084,6 @@ Lmf_traf:
 2:	mul	x14, x11, x12
 	sdiv	x14, x14, x13
 	str	x14, [x19, #TR_SHIFT]
-	b	Lmf_runs
-3:	ldr	w9, [x20, #ST_LIVE]       ; live: the timeline starts at the first sample
-	cbz	w9, Lmf_runs
-	ldr	x9, [x19, #TR_SHIFT]
-	cbnz	x9, Lmf_runs
-	str	x10, [x19, #TR_SHIFT]
 Lmf_runs:
 	str	x24, [sp, #MF_AT]
 Lmf_run:
@@ -6231,11 +6190,10 @@ Ltr_none:
 	str	xzr, [x19, #TR_FL]
 	b	Lret4
 
-; st_open(stream, url, live) — start a stream from its first byte (the URL is the stream's); its size from the URL's clen, if any.
+; st_open(stream, url) — start a stream from its first byte (the URL is the stream's); its size from the URL's clen, if any.
 st_open:
 	FRAME	1, 0, 1
 	str	x1, [x19, #ST_URL]
-	str	w2, [x19, #ST_LIVE]
 	mov	x0, x1
 	CSTR	x1, "clen="
 	bl	_strstr
@@ -6427,7 +6385,7 @@ Lsg_inf:
 	mov	x9, #1000
 	scvtf	d1, x9
 	fmul	d0, d0, d1
-	fcvtzs	x24, d0
+	fcvtns	x24, d0
 	b	Lsg_next
 Lsg_br:
 	add	x0, x22, #17              ; #EXT-X-BYTERANGE:n[@o]
@@ -6470,8 +6428,8 @@ Lsg_end:
 	b	Lsg_next
 Lsg_disc:
 	ldrb	w9, [x22, #20]
-	cmp	w9, #'-'
-	b.eq	Lsg_next                  ; DISCONTINUITY-SEQUENCE
+	cmp	w9, #' '
+	b.hi	Lsg_next                  ; DISCONTINUITY-SEQUENCE
 	mov	w9, #1
 	str	w9, [x19, #SG_DISC]
 Lsg_next:
@@ -6732,9 +6690,7 @@ st_get:
 	cbz	x0, Lpu_end
 	mov	x20, x0
 	cbnz	x24, 1f
-	ldr	w9, [x19, #ST_LIVE]
-	orr	w9, w9, w22
-	cbnz	w9, Lgt_go                ; a whole text or segment
+	cbnz	w22, Lgt_go               ; a whole text or segment
 	mov	x24, #CHUNK               ; a stream's bytes: googlevideo slows anything larger to real time
 	ldr	x11, [x19, #ST_LEN]
 	sub	x12, x11, x23
@@ -6886,8 +6842,19 @@ Lhp_whole:
 	b	Lret3
 Lhp_seg:
 	ldr	x9, [sp, #(HP_SEG + SG_T)]
-	str	x9, [x19, #ST_SEGT]
-	str	wzr, [x19, #ST_ENC]
+	ldr	x10, [x19, #ST_PLOFF]
+	add	x9, x9, x10
+	ldr	x10, [sp, #(HP_SEG + SG_SEQ)]
+	ldp	x12, x11, [x19, #ST_SEGN]
+	stp	x10, x9, [x19, #ST_SEGN]
+	cmp	x12, x10
+	b.eq	1f
+	cmp	x12, #0
+	csel	x12, x10, x12, eq
+	csel	x11, x9, x11, eq
+	str	x11, [x27, #E_MTIME]
+	str	x12, [x27, #E_MSEQ]
+1:	str	wzr, [x19, #ST_ENC]
 	ldr	x20, [sp, #(HP_SEG + SG_KEY)]
 	cbz	x20, Lhp_map
 	mov	x0, x20                   ; AES-128: its key, fetched once
@@ -6990,7 +6957,8 @@ Lhp_get:
 	str	wzr, [x19, #ST_SEGF]
 	ldr	w9, [sp, #(HP_SEG + SG_DISC)]
 	cbz	w9, 2f
-	mov	x9, #-1                   ; a discontinuity: the timeline is anchored again
+	ldr	x9, [x27, #E_T0]          ; a discontinuity: the timeline is anchored again
+	orr	x9, x9, #(1 << 63)
 	str	x9, [x27, #E_T0]
 2:	mov	x0, x19
 	bl	seg_reset
@@ -7039,16 +7007,32 @@ Lht_list:
 	bl	hls_pick
 	cbz	w0, Lsd_end
 	ldr	w9, [x27, #(E_ST + ST_SIZE + ST_KIND)]
-	cbz	w9, Lht_pump              ; no sound rendition (a broadcast's DASH sound waits for Audio Only)
+	cbz	w9, Lht_pump              ; no sound rendition
 	BADDR	x0, (E_ST + ST_SIZE)
 	bl	st_pump
-	b	Lht_pump
+	ldr	w9, [x28, #G_AONLY]
+	cbz	w9, Lht_pump
+	b	Lret2
 Lht_media:
 	ldr	x0, [x19, #ST_PL]
 	bl	_free
 	str	x20, [x19, #ST_PL]
 	str	wzr, [x19, #ST_STALE]
-	ldr	x9, [x19, #ST_SEQ]
+	ldr	w9, [x19, #ST_ENDED]
+	cbnz	w9, 3f
+	ldp	x2, x20, [x19, #ST_SEGN]
+	cbnz	x2, 5f
+	ldr	x2, [x27, #E_MSEQ]
+	ldr	x20, [x27, #E_MTIME]
+5:	mov	x0, x19
+	mov	w1, #0
+	mov	x3, sp
+	bl	seg_scan
+	cbz	w0, 3f
+	ldr	x10, [sp, #SG_T]
+	sub	x9, x20, x10
+	str	x9, [x19, #ST_PLOFF]
+3:	ldr	x9, [x19, #ST_SEQ]
 	cbnz	x9, Lht_pump              ; already playing: it goes on from its sequence number
 	mov	x0, x19                   ; the first: the whole playlist read, its length and end
 	mov	w1, #1
@@ -7059,23 +7043,41 @@ Lht_media:
 	str	w9, [x19, #ST_TDUR]
 	ldr	w9, [sp, #SG_END]
 	str	w9, [x19, #ST_ENDED]
+	ldr	x21, [x27, #E_MSEQ]
 	cbnz	w9, 1f
-	ldr	x10, [sp, #SG_SEQ0]       ; live: a few segments from its live edge, no length
+	ldr	x9, [x19, #ST_PEND]
+	cmp	x9, #0
+	ccmp	x21, #0, #4, gt
+	b.ne	2f
+4:	ldr	x10, [sp, #SG_SEQ0]       ; live: a few segments from its live edge, no length
 	ldr	w11, [sp, #SG_N]
 	subs	w11, w11, #HLS_LIVE_BACK
 	csel	w11, w11, wzr, gt
 	add	x10, x10, w11, uxtw
 	str	x10, [x19, #ST_SEQ]
+	cbnz	x21, Lht_pump
+	mov	x0, x19
+	mov	w1, #0
+	mov	x2, x10
+	mov	x3, sp
+	bl	seg_scan
+	ldr	x9, [sp, #SG_T]
+	neg	x9, x9
+	str	x9, [x19, #ST_PLOFF]
 	b	Lht_pump
-1:	ldr	x9, [x27, #E_DURMS]       ; on demand: its length, then the segment of the target
+1:	str	xzr, [x19, #ST_PLOFF]
+	ldr	x9, [x27, #E_DURMS]       ; on demand: its length, then the segment of the target
 	cbnz	x9, 2f
 	ldr	x9, [sp, #SG_T]
 	str	x9, [x27, #E_DURMS]
 2:	mov	x0, x19
 	mov	w1, #1
 	ldr	x2, [x19, #ST_PEND]       ; where it was sought
+	ldr	x9, [x19, #ST_PLOFF]
+	sub	x2, x2, x9
 	mov	x3, sp
 	bl	seg_scan
+	cbz	w0, 4b
 	ldr	x9, [sp, #SG_SEQ]
 	str	x9, [x19, #ST_SEQ]
 Lht_pump:
@@ -7257,8 +7259,7 @@ vtt_cues:
 	bl	vtt_time
 	sub	x23, x23, x0
 2:	ldr	x9, [x27, #E_T0]
-	cmp	x9, #0
-	csel	x9, x9, xzr, gt
+	sbfx	x9, x9, #0, #63
 	mov	x10, #90
 	sdiv	x9, x9, x10
 	sub	x23, x23, x9
@@ -10416,12 +10417,6 @@ q_push:
 	b	trk_request
 1:	ret
 
-; trk_clear(track) — q_clear for a UI program.
-trk_clear:
-	FRAME	1, 0, 1
-	bl	q_clear
-	b	Lret1
-
 ; q_clear — drop the track's queued samples and fragment list (x19 = track).
 q_clear:
 	FRAME	1
@@ -11212,7 +11207,7 @@ Lp_subobs:
 	.pushsection __DATA,__data
 Lp_eaonly:
 	LDEW	E_NET
-	JNZ	Lp_eaonly_net
+	JNZ	Lp_eaonly_vod
 	LDE	E_VT
 	JZ	Lp_eaonly_end
 	LW	G_AONLY
@@ -11233,28 +11228,6 @@ Lp_eaonly:
 	.long	Lblk_v - Lvm_base
 	HERE	Lp_eaonly_end
 	OP_END
-	HERE	Lp_eaonly_net
-	LDEW	E_LIVE
-	JZ	Lp_eaonly_vod
-	CALL	F_malloc, "=I"            ; a broadcast: opened again with the other stream
-	.byte	32
-	JZ	Lp_eaonly_none
-	SL	1
-	LDEW	E_GEN
-	STW	1, YT_GEN
-	IMM	1
-	STW	1, YT_LIVE
-	IMM	0
-	STX	1, YT_DUR
-	LDE	E_ST + ST_URL
-	CALL	F_strdup, "=V"
-	STX	1, YT_V
-	LDE	E_ST + ST_SIZE + ST_URL
-	CALL	F_strdup, "=V"
-	STX	1, YT_A
-	NCALL	eng_tube, "b"
-	HERE	Lp_eaonly_none
-	OP_END
 	HERE	Lp_eaonly_vod
 	LDE	E_VR                      ; streams: the picture's stream stops, or starts again just ahead
 	MSG	S_stopRequestingMediaData
@@ -11270,12 +11243,15 @@ Lp_eaonly:
 	JZ	Lp_eaonly_off
 	LDE	E_VT                      ; on: what is queued goes; YouTube's picture stream stops (one stream for both goes on, its pictures dropped)
 	JZ	Lp_eaonly_kept
-	NCALL	trk_clear, "V"
+	NCALL	trk_target, "VX"
+	.long	0xffffffff
 	HERE	Lp_eaonly_kept
 	GL	2
 	JZ	Lp_eaonly_done
 	NCALL	st_reset, "B"
 	.short	E_ST
+	IMM	1
+	STEW	E_ST + ST_EOS
 	OP_END
 	HERE	Lp_eaonly_off
 	NCALL	now_ms, "="
@@ -11286,6 +11262,11 @@ Lp_eaonly:
 	STEW	E_PREV
 	GL	3
 	ADDH	1000                      ; YouTube: its picture stream from a second ahead, fetched and decoded meanwhile
+	SL	3
+	LDEW	E_LIVE
+	MULH	1000
+	ADDL	3
+	STE	E_TGTMS
 	NCALL	st_seek, "BV"
 	.short	E_ST
 	OP_END
@@ -11402,6 +11383,9 @@ ahead_ms:
 	ldr	w11, [x10, #ST_EOS]
 	cbnz	w11, 1f
 	ldr	x10, [x0, #TR_LAST]
+	ldr	x11, [x0, #TR_TGT]
+	cmp	x10, x11
+	csel	x10, x10, x11, gt
 	mov	x11, #1000
 	mul	x10, x10, x11
 	ldr	w11, [x0, #TR_TS]
@@ -11440,24 +11424,25 @@ Lp_tube:
 	EQ	0
 	STEW	E_WANTV
 	JNZ	Lp_tube_open
+	GL	1
+	JNZ	Lp_tube_open
 	GL	2                         ; Audio Only: kept for later
 	STE	E_ST + ST_URL
 	JMP	Lp_tube_sound
 	HERE	Lp_tube_open
-	NCALL	st_open, "BcI"
+	NCALL	st_open, "Bc"
 	.short	E_ST
-	.byte	0
 	GL	1
 	JZ	Lp_tube_sound
-	GL	0                         ; a broadcast's picture is its HLS, sound in it: the DASH sound is kept for Audio Only
+	GL	0                         ; a broadcast's picture is its HLS, sound in it
 	LDX	YT_A
-	STE	E_ST + ST_SIZE + ST_URL
+	CALL	F_free, "V"
 	JMP	Lp_tube_done
 	HERE	Lp_tube_sound
 	GL	0
 	LDX	YT_A
 	SL	3
-	NCALL	st_open, "Bdb"
+	NCALL	st_open, "Bd"
 	.short	E_ST + ST_SIZE
 	HERE	Lp_tube_done
 	CALL	F_free, "a"
@@ -11493,9 +11478,8 @@ Lp_web:
 	CALL	F_free, "a"
 	GL	1
 	JZ	Lp_web_end
-	NCALL	st_open, "BbI"
+	NCALL	st_open, "Bb"
 	.short	E_ST
-	.byte	0
 	NCALL	await
 	LDEW	E_GEN
 	NCALL	tick_later, "V"
