@@ -600,6 +600,7 @@ Lc\@:	.asciz	"\text"
 .equ STALL_FULL,                 2000
 .equ BPS_START,                  4000000  ; HLS starts with the best variant under this, then follows the measured speed
 .equ HLS_LIVE_BACK,              3        ; a broadcast starts this many segments from its live edge
+.equ HLS_T0_BITS,                4
 .equ CLOCK_UPTIME_RAW,           8
 .equ AFS_READY,                  0x72656479 ; 'redy'
 .equ AFS_FORMAT,                 0x64666d74 ; 'dfmt'
@@ -621,7 +622,7 @@ Lc\@:	.asciz	"\text"
 .equ SG_SEQ0,                    72       ; the playlist's first
 .equ SG_TDUR,                    80       ; w: target duration, ms
 .equ SG_END,                     84       ; w: EXT-X-ENDLIST
-.equ SG_DISC,                    88       ; w: a discontinuity before it
+.equ SG_DSEQ,                    88
 .equ SG_N,                       92       ; w: segments counted
 .equ SG_SIZE,                    96
 
@@ -1503,8 +1504,9 @@ _\name:
 .equ E_NET,                      E_GEN + 4 ; w: the media comes as streams
 .equ E_WANTV,                    E_NET + 4 ; w: a picture is coming: the clock waits for it
 .equ E_TGTMS,                    E_WANTV + 4 ; the last seek's target, ms
-.equ E_T0,                       E_TGTMS + 8 ; HLS: the timeline's origin in 90 kHz units (the first PTS less its segment's start), -1 unknown
-.equ E_MASTER,                   E_T0 + 8  ; the master playlist and its URL
+.equ E_T0,                       E_TGTMS + 8 ; HLS: the timeline's origin in 90 kHz units (the first PTS less its segment's start)
+.equ E_T0S,                      E_T0 + 8
+.equ E_MASTER,                   E_T0S + (8 << HLS_T0_BITS) ; the master playlist and its URL
 .equ E_MURL,                     E_MASTER + 8
 .equ E_BPS,                      E_MURL + 8 ; the measured network speed, bits per second
 .equ E_FIRSTMS,                  E_BPS + 8 ; the first picture shown after a seek, ms (+1), 0 none yet; bit 63: ready on a poll already
@@ -5211,6 +5213,7 @@ Lsk_hls:
 	stp	xzr, xzr, [x19, #ST_SEQ]  ; HLS: the segment from the playlist, or when it comes
 	mov	x0, x19
 	bl	seg_reset
+	str	xzr, [x19, #ST_T0]
 	ldr	x9, [x19, #ST_PL]
 	cbz	x9, Lsk_hgo
 	ldr	w10, [x19, #ST_ENDED]
@@ -5221,8 +5224,7 @@ Lsk_hls:
 	sub	sp, sp, #SG_SIZE
 	mov	x3, sp
 	bl	seg_scan
-	ldr	x9, [sp, #SG_SEQ]
-	ldr	x10, [sp, #SG_SEQ0]
+	ldp	x9, x10, [sp, #SG_SEQ]
 	ldr	w11, [sp, #SG_N]
 	add	x10, x10, w11, uxtw
 	add	sp, sp, #SG_SIZE
@@ -5251,8 +5253,7 @@ Lsk_top:
 Lsk_at:
 	str	wzr, [x19, #ST_PST]
 Lsk_go:
-	str	x0, [x19, #ST_POS]
-	str	x0, [x19, #ST_SPOS]
+	stp	x0, x0, [x19, #ST_POS]
 	str	xzr, [x19, #ST_EOS]
 	b	Lhd_next
 Lsk_x:
@@ -5300,8 +5301,7 @@ st_cursors:
 ; trk_seek — the cursor at the sync sample before the track's target (preroll for sound) (x19 = track).
 trk_seek:
 	FRAME	0
-	ldr	x0, [x19, #TR_TGT]
-	ldr	x9, [x19, #TR_SHIFT]
+	ldp	x9, x0, [x19, #TR_SHIFT]
 	add	x0, x0, x9                ; in the media's own time
 	ldr	w9, [x19, #TR_KIND]
 	mov	w1, #1
@@ -5486,15 +5486,13 @@ Lsp_keep:
 Lsp_mdat:
 	ldr	x9, [x19, #ST_MOOV]
 	cbnz	x9, 4f
-	ldr	x9, [x19, #ST_SPOS]       ; media data before the movie box: read the movie box after it first
-	ldr	x10, [x19, #ST_LEFT]
+	ldp	x9, x10, [x19, #ST_SPOS]  ; media data before the movie box: read the movie box after it first
 	add	x9, x9, x10
 	str	x9, [x19, #ST_MDEND]
 	mov	x0, x19
 	bl	st_reset
 	ldr	x9, [x19, #ST_MDEND]
-	str	x9, [x19, #ST_POS]
-	str	x9, [x19, #ST_SPOS]
+	stp	x9, x9, [x19, #ST_POS]
 	b	Lhd_next
 4:	ldr	x9, [x19, #ST_SPOS]
 	add	x10, x9, x10
@@ -5583,8 +5581,7 @@ arena_new:
 Lan_free:
 	mov	x0, x23
 	bl	_free
-	str	xzr, [x19, #ST_AR]
-	str	xzr, [x19, #ST_ARBB]
+	stp	xzr, xzr, [x19, #ST_AR]
 Lan_fail:
 	mov	x0, #0
 	b	Lret3
@@ -5663,10 +5660,9 @@ Lem_sample:
 	mov	w12, #24
 	umaddl	x11, w10, w12, x11        ; {offset, size, duration, composition, flags}
 	ldr	x12, [x11]
-	ldr	w2, [x11, #8]
+	ldp	w2, w5, [x11, #8]
 	ldp	x14, x15, [x20, #ST_ARPOS]
 	add	w10, w10, #1
-	ldr	w5, [x11, #12]
 	ldr	x3, [x19, #TR_FDTS]
 	add	x16, x3, x5
 	subs	x1, x12, x14
@@ -5794,8 +5790,7 @@ mvhd_read:
 	cmp	x9, x1
 	b.hi	2f
 	ldrb	w9, [x0]                  ; version: 32- or 64-bit times
-	ldr	w10, [x0, #12]
-	ldr	w11, [x0, #16]
+	ldp	w10, w11, [x0, #12]
 	rev	w11, w11
 	cbz	w9, 1f
 	ldr	w10, [x0, #20]
@@ -5974,9 +5969,8 @@ trex_read:
 	ldr	w10, [x19, #TR_ID]
 	cmp	w9, w10
 	b.ne	2f
-	ldr	w9, [x0, #12]
+	ldp	w9, w10, [x0, #12]
 	rev	w9, w9
-	ldr	w10, [x0, #16]
 	rev	w10, w10
 	ldr	w11, [x0, #20]
 	rev	w11, w11
@@ -6075,11 +6069,10 @@ Lmf_traf:
 	mov	x13, #(90000 & 0xffff)
 	movk	x13, #(90000 >> 16), lsl #16
 	mul	x14, x10, x13
-	udiv	x14, x14, x12
-	mov	x0, x14
-	mov	x1, x20
+	udiv	x1, x14, x12
+	mov	x0, x20
 	bl	t33_time
-	sub	x11, x14, x0
+	sub	x11, x1, x4
 	mul	x14, x11, x12
 	sdiv	x14, x14, x13
 	str	x14, [x19, #TR_SHIFT]
@@ -6337,14 +6330,13 @@ Lsg_pass:
 	add	x10, x10, x11
 	str	x10, [sp]
 	str	xzr, [x19, #SG_BRL]
-	str	wzr, [x19, #SG_DISC]
+	strb	wzr, [x19, #(SG_DSEQ + 3)]
 	b	Lsg_next
 Lsg_hit:
 	str	x9, [x19, #SG_SEQ]
-	str	x22, [x19, #SG_URI]
 	mov	x0, x22
 	bl	line_end
-	str	x0, [x19, #SG_URIE]
+	stp	x22, x0, [x19, #SG_URI]
 	stp	x23, x24, [x19, #SG_T]
 	str	w26, [x19, #SG_N]
 	mov	w0, #1
@@ -6359,6 +6351,9 @@ Lsg_tag:
 	mov	w10, #('B' | 'Y' << 8)    ; BYTERANGE, not BITRATE
 	cmp	w9, w10
 	b.eq	Lsg_br
+	mov	w10, #('D' | 'I' << 8)
+	cmp	w9, w10
+	b.eq	Lsg_disc
 	and	w9, w9, #0xff
 	cmp	w9, #'K'
 	b.eq	Lsg_key
@@ -6366,8 +6361,6 @@ Lsg_tag:
 	b.eq	Lsg_tdur
 	cmp	w9, #'E'
 	b.eq	Lsg_end
-	cmp	w9, #'D'
-	b.eq	Lsg_disc
 	cmp	w9, #'M'
 	b.ne	Lsg_next
 	ldrb	w9, [x22, #8]
@@ -6426,11 +6419,15 @@ Lsg_end:
 	str	w9, [x19, #SG_END]
 	b	Lsg_next
 Lsg_disc:
+	ldr	w0, [x19, #SG_DSEQ]
+	add	w0, w0, #1
+	orr	w0, w0, #(1 << 31)
 	ldrb	w9, [x22, #20]
 	cmp	w9, #' '
-	b.hi	Lsg_next                  ; DISCONTINUITY-SEQUENCE
-	mov	w9, #1
-	str	w9, [x19, #SG_DISC]
+	b.ls	1f
+	add	x0, x22, #30              ; DISCONTINUITY-SEQUENCE
+	bl	strtol10
+1:	str	w0, [x19, #SG_DSEQ]
 Lsg_next:
 	mov	x0, x22
 	bl	line_end
@@ -6777,8 +6774,7 @@ seg_reset:
 	str	wzr, [x0, #ST_TSN]
 	str	xzr, [x0, #(ST_VPES + 8)]
 	str	xzr, [x0, #(ST_APES + 8)]
-	str	wzr, [x0, #ST_PST]
-	str	wzr, [x0, #ST_HN]
+	stp	wzr, wzr, [x0, #ST_PST]
 	ret
 
 ; hexbyte(hi, lo) -> w9 = the byte two hex digits spell (w9, w10 in).
@@ -6822,6 +6818,7 @@ Lhp_again:
 	mov	w9, #1                    ; live, not out yet: the playlist again in half a target duration
 	str	w9, [x19, #ST_STALE]
 	ldr	w0, [sp, #(HP_SEG + SG_TDUR)]
+Lhp_later:
 	mov	x1, x19
 	bl	st_later
 	b	Lret3
@@ -6847,13 +6844,34 @@ Lhp_seg:
 	ldp	x12, x11, [x19, #ST_SEGN]
 	stp	x10, x9, [x19, #ST_SEGN]
 	cmp	x12, x10
-	b.eq	1f
+	ccmp	x12, #0, #4, eq
+	b.ne	1f
 	cmp	x12, #0
 	csel	x12, x10, x12, eq
 	csel	x11, x9, x11, eq
 	str	x11, [x27, #E_MTIME]
 	str	x12, [x27, #E_MSEQ]
-1:	str	wzr, [x19, #ST_ENC]
+	ldr	w9, [sp, #(HP_SEG + SG_DSEQ)] ; a discontinuity: the timeline is anchored again
+	ldr	x10, [x19, #ST_T0]
+	ubfx	x10, x10, #33, #30
+	add	w11, w10, w9, lsr #31
+	csel	w11, w10, w11, eq
+	and	w9, w9, #((1 << 24) - 1)
+	cmp	w9, w11
+	csel	w9, w9, w11, hi
+	cmp	w9, w10
+	b.eq	1f
+	ubfiz	x9, x9, #33, #30
+	str	x9, [x19, #ST_T0]
+1:	BADDR	x9, (E_ST + 2 * ST_SIZE)
+	ldr	x10, [x19, #ST_T0]
+	orr	x10, x10, #(1 << 63)
+	ldr	x11, [x27, #E_T0]
+	cmp	x19, x9
+	ccmp	x10, x11, #0, eq
+	mov	w0, #200
+	b.hi	Lhp_later
+	str	wzr, [x19, #ST_ENC]
 	ldr	x20, [sp, #(HP_SEG + SG_KEY)]
 	cbz	x20, Lhp_map
 	mov	x0, x20                   ; AES-128: its key, fetched once
@@ -6941,8 +6959,7 @@ Lhp_map:
 	bl	strtol10
 	mov	x3, x0
 	ldr	x4, [sp, #(HP_SEG + SG_BRO)]
-7:	str	wzr, [x19, #ST_PST]
-	str	wzr, [x19, #ST_HN]
+7:	stp	wzr, wzr, [x19, #ST_PST]
 	mov	x0, x19
 	mov	x1, x22
 	mov	w2, #4
@@ -6954,12 +6971,7 @@ Lhp_get:
 	ldr	x9, [x19, #ST_SEGOFF]
 	cbnz	x9, 1f
 	str	wzr, [x19, #ST_SEGF]
-	ldr	w9, [sp, #(HP_SEG + SG_DISC)]
-	cbz	w9, 2f
-	ldr	x9, [sp, #(HP_SEG + SG_SEQ)] ; a discontinuity: the timeline is anchored again
-	ubfiz	x9, x9, #33, #30
-	str	x9, [x19, #ST_T0]
-2:	mov	x0, x19
+	mov	x0, x19
 	bl	seg_reset
 1:	ldr	x0, [x19, #ST_PLURL]
 	ldp	x1, x2, [sp, #(HP_SEG + SG_URI)]
@@ -7071,8 +7083,7 @@ Lht_media:
 	str	x9, [x27, #E_DURMS]
 2:	mov	x0, x19
 	mov	w1, #1
-	ldr	x2, [x19, #ST_PEND]       ; where it was sought
-	ldr	x9, [x19, #ST_PLOFF]
+	ldp	x9, x2, [x19, #ST_PLOFF]  ; where it was sought
 	sub	x2, x2, x9
 	mov	x3, sp
 	bl	seg_scan
@@ -7096,8 +7107,7 @@ hls_done:
 	cmp	w9, #3
 	b.eq	Lhd_seg
 	b.hi	Lhd_map
-	ldr	x0, [x19, #ST_TXT]        ; a playlist or key: NUL-terminated
-	ldr	x1, [x19, #ST_TXTN]
+	ldp	x0, x1, [x19, #ST_TXT]    ; a playlist or key: NUL-terminated
 	add	x1, x1, #1
 	bl	_realloc
 	cbz	x0, Lhd_fail
@@ -7247,17 +7257,21 @@ vtt_cues:
 	cbz	x0, 1f
 	add	x0, x0, #7
 	bl	strtol10
-1:	ldr	x9, [x27, #E_T0]
-	sub	x0, x0, x9
-	mov	x9, #90
-	sdiv	x23, x0, x9               ; its cues' offset on the timeline, ms
+1:	ldr	x9, [x20, #ST_T0]
+	ubfx	x9, x9, #33, #HLS_T0_BITS
+	add	x9, x27, x9, lsl #3
+	ldr	x9, [x9, #E_T0S]
+	tbnz	x9, #63, 3f
+	ldr	x9, [x27, #E_T0]
+3:	sub	x23, x0, x9
 	mov	x0, x21
 	CSTR	x1, "LOCAL:"
 	bl	_strstr
 	cbz	x0, 2f
 	add	x0, x0, #6
 	bl	vtt_time
-	sub	x23, x23, x0
+	mov	x9, #90
+	msub	x23, x0, x9, x23
 2:	mov	x24, x21
 Lvc_cue:
 	mov	x0, x24
@@ -7328,16 +7342,15 @@ Lvc_cue:
 	ldr	x0, [sp, #VC_BB]
 	mov	x1, #0
 	add	x2, x22, #2
-	add	x4, x26, x23
 	ldr	x10, [x20, #ST_SEGT]
 	ldr	x11, [x27, #(E_ST + ST_SEGT)]
 	cmp	x10, x11
 	csel	x10, x10, x11, gt
 	ldr	w11, [x20, #ST_TDUR]
 	add	x10, x10, w11, uxtw #1
-	sub	x4, x4, x10
+	sub	x4, x26, x10
 	mov	x9, #90
-	mul	x4, x4, x9
+	madd	x4, x4, x9, x23
 	orr	x4, x4, #~((1 << 33) - 1)
 	sdiv	x4, x4, x9
 	add	x4, x4, x10
@@ -7742,15 +7755,12 @@ pes_done:
 	b.hs	Lret3
 	mov	x3, #-1                   ; untimed: a picture's goes on the waiting unit
 	tbz	w9, #7, Lpz_cont
-	add	x0, x20, #9
-	mov	x1, x19
+	add	x1, x20, #9
 	bl	pts_time
-	mov	x3, x0
-	mov	x4, x0
+	mov	x3, x4
 	tbz	w9, #6, Lpz_go
-	add	x0, x20, #14
+	add	x1, x20, #14
 	bl	pts_time
-	mov	x4, x0
 Lpz_go:
 	ldr	x0, [x19, #ST_VT]
 	cbz	w22, 4f
@@ -7768,30 +7778,35 @@ Lpz_cont:
 	b	Lret3
 
 pts_time:
-	ldr	x10, [x0]
+	ldr	x10, [x1]
 	rev	x10, x10
-	lsr	x0, x10, #27
-	bfxil	x0, x10, #26, #30
-	bfxil	x0, x10, #25, #15
+	lsr	x1, x10, #27
+	bfxil	x1, x10, #26, #30
+	bfxil	x1, x10, #25, #15
 t33_time:
-	ldr	x10, [x1, #ST_SEGT]
+	ldr	x10, [x0, #ST_SEGT]
 	mov	x11, #90
 	mul	x10, x10, x11
-	sub	x0, x0, x10
-	ldr	x11, [x1, #ST_T0]
+	sub	x4, x1, x10
+	ldr	x11, [x0, #ST_T0]
 	tbnz	x11, #63, 2f
+	orr	x11, x11, #(1 << 63)
+	ubfx	x5, x11, #33, #HLS_T0_BITS
+	add	x5, x27, x5, lsl #3
+	ldr	x2, [x5, #E_T0S]
+	ldr	w6, [x0, #ST_ENDED]
+	cbnz	w6, 1f
 	ldr	x2, [x27, #E_T0]
-	eor	x2, x2, x11
-	tst	x2, #~((1 << 33) - 1)
-	eor	x2, x2, x11
-	bfxil	x11, x0, #0, #33
+1:	eor	x6, x2, x11
+	tst	x6, #~((1 << 33) - 1)
+	bfxil	x11, x4, #0, #33
 	csel	x11, x2, x11, eq
 	str	x11, [x27, #E_T0]
-	orr	x11, x11, #(1 << 63)
-	str	x11, [x1, #ST_T0]
-2:	sub	x0, x0, x11
-	sbfx	x0, x0, #0, #33
-	add	x0, x0, x10
+	str	x11, [x0, #ST_T0]
+	str	x11, [x5, #E_T0S]
+2:	sub	x4, x4, x11
+	sbfx	x4, x4, #0, #33
+	add	x4, x4, x10
 	ret
 
 ; next_sc(p, end) -> x0 = the next 00 00 01 at or after p, or end: 16 bytes at a time while none of them is zero.
@@ -8881,10 +8896,9 @@ pa_feed:
 	add	x20, x20, x0              ; past the tag
 	sub	x21, x21, x0
 	tbnz	x1, #63, Lpa_track
-	mov	x0, x1
-	mov	x1, x19
+	mov	x0, x19
 	bl	t33_time
-	mov	x23, x0
+	mov	x23, x4
 Lpa_track:
 	ldr	x22, [x19, #ST_AT]
 	cbnz	x22, Lpa_feed
@@ -9619,8 +9633,7 @@ Lto_tables:
 	cbnz	w26, Lto_edit             ; fragmented: samples come later
 	ldr	w9, [x19, #TR_N]
 	ldr	w10, [x19, #TR_NST]
-	ldr	w11, [x19, #TR_NSC]
-	ldr	w12, [x19, #TR_NCH]
+	ldp	w11, w12, [x19, #TR_NSC]
 	cmp	w9, #0
 	ccmp	w10, #0, #4, ne
 	ccmp	w11, #0, #4, ne
@@ -10527,6 +10540,7 @@ Lp_seek:
 	IMM	0
 	STE	E_FIRSTMS
 	STEW	E_PREV
+	STE	E_T0
 	LDEW	E_NET
 	JNZ	Lp_seek_net
 	LDE	E_VT
@@ -10572,7 +10586,13 @@ Lp_seek:
 	LDE	E_AR
 	MSG	S_stopRequestingMediaData
 	LW	G_AONLY
+	JZ	Lp_seek_pic
+	LDE	E_ST + ST_SIZE + ST_URL
+	SL	2
+	LDE	E_ST + ST_SIZE + ST_PLURL
+	ADDL	2
 	JNZ	Lp_seek_streams           ; Audio Only: the picture's stream stays still
+	HERE	Lp_seek_pic
 	NCALL	st_seek, "Ba"
 	.short	E_ST
 	HERE	Lp_seek_streams
@@ -11401,8 +11421,6 @@ ahead_ms:
 	.pushsection __DATA,__data
 Lp_tube:
 	NCALL	eng_close
-	IMM	-1
-	STE	E_T0
 	NCALL	hold, "I"
 	.byte	0
 	GL	0
@@ -11462,8 +11480,6 @@ Lp_tube:
 	.pushsection __DATA,__data
 Lp_web:
 	NCALL	eng_close
-	IMM	-1                        ; HLS: the timeline is anchored at the first time stamp
-	STE	E_T0
 	NCALL	hold, "I"
 	.byte	0
 	GL	0
@@ -13804,7 +13820,7 @@ Lkt_sound:
 Lkt_aac:
 	cbnz	x24, 2f                   ; an old CodecID without its config: AAC LC's, from the rate and channels
 	mov	x9, #0
-	adr	x10, Lk_rates
+	GADDR	x10, Lk_rates
 3:	ldr	w11, [x10, x9, lsl #2]
 	cbz	w11, Lkt_no
 	cmp	w11, w26
@@ -13902,8 +13918,11 @@ Lkt_take:
 Lkt_no:
 	bl	xs_drop                   ; the slot stays free
 	b	Lret4
+	.pushsection __DATA,__data
+	.p2align 2
 Lk_rates:
 	.long	96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350, 0
+	.popsection
 
 ; mkv_scale(units per second) — the track's time scale; its units per tick, the ticks' rounding, a frame's default duration and the codec's delay in it (x19 = track, x20/x21 = its TrackEntry, x22 = mkv_open's context).
 mkv_scale:
@@ -14010,8 +14029,7 @@ img_fd:
 	rev16	w10, w10
 	strh	w10, [x26, #34]
 	mov	w9, #0x4800               ; 72 dpi either way
-	str	w9, [x26, #36]
-	str	w9, [x26, #40]
+	stp	w9, w9, [x26, #36]
 	mov	w9, #0x1800               ; depth 24
 	strh	w9, [x26, #82]
 	mov	w9, #0xffff
@@ -16093,7 +16111,7 @@ asc_info:
 	orr	w11, w11, w10, lsr #7     ; its rate's index
 	cmp	w11, #13
 	b.hs	1f
-	adr	x12, Lk_rates
+	GADDR	x12, Lk_rates
 	ldr	w0, [x12, x11, lsl #2]
 	ubfx	w1, w10, #3, #4           ; channels; 0 (a PCE's): stereo, 7: eight
 	cmp	w1, #0
