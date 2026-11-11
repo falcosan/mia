@@ -973,7 +973,7 @@ Lc\@:	.asciz	"\text"
 .equ G_MEDIAQ,                   G_PIP + 8 ; the engine's serial queue
 .equ G_SBV,                      G_MEDIAQ + 8 ; the view of the engine's picture
 .equ G_SBLAYER,                  G_SBV + 8 ; and its layer, made on the media queue
-.equ G_MODE,                     G_SBLAYER + 8 ; 0: the engine plays, 1: AVPlayer (main)
+.equ G_MODE,                     G_SBLAYER + 8 ; 0: the engine plays, 1: AVPlayer, 2: AVPlayer with AirPlay's next track, until it is ready (main)
 .equ G_PLAYING,                  G_MODE + 4 ; the engine should be playing (main)
 .equ G_VOLPCT,                   G_PLAYING + 4 ; volume 0..100 and mute, for both players (main)
 .equ G_MUTED,                    G_VOLPCT + 4
@@ -1535,19 +1535,19 @@ _\name:
 .equ E_TR,                       (E_ST + STREAMS * ST_SIZE + 63) & ~63 ; Track[TRACKS]
 .equ E_CLRN,                     E_TR + TRACKS * TR_SIZE - E_CLR
 .equ B_RQT,                      E_TR + TRACKS * TR_SIZE ; {task, record}[RQS]: requests running (media queue)
-.equ B_LTPATH,                   B_RQT + 16 * RQS ; char[1024], This Mac's file, for AVPlayer when the engine cannot play it (main)
-.equ B_LTVURL,                   B_LTPATH + 1024 ; char[4096], YouTube's own HLS, for AirPlay, or "" (main)
-.equ B_VISITOR,                  B_LTVURL + 4096 ; char[288], the visitorData member once YouTube gave it (lock)
+.equ B_LTPATH,                   B_RQT + 16 * RQS ; char[4096], This Mac's media for AVPlayer (AirPlay, or what the engine cannot play): the file's or web media's URL, YouTube's own HLS, or "" (main)
+.equ B_VISITOR,                  B_LTPATH + 4096 ; char[288], the visitorData member once YouTube gave it (lock)
 .equ B_SUBL,                     B_VISITOR + 288 ; the subtitle layer, made on first use (main)
 .equ B_PIC,                      B_SUBL + 8 ; w: the picture's turn, width and height, as the view lays it out (main)
 .equ B_PIPE,                     B_PIC + 16 ; the engine picture's Picture in Picture controller, made on first use (main)
-.equ B_AIRK,                     B_PIPE + 8 ; w: what the dormant AVPlayer would play over AirPlay: 0 nothing, 1 B_LTPATH's file, 2 its URL, 3 B_LTVURL (main)
+.equ B_AIRK,                     B_PIPE + 8 ; AirPlay takes B_LTPATH when not 0 (its length); 0 for what AVPlayer cannot play (main)
 .equ B_VTW,                      B_AIRK + 8 ; eng_init's parameter sets: pointers, sizes, the format, a session (media queue)
 .equ B_AFF,                      B_VTW + 64 ; pic_layout's turn: a, b, c, d, tx, ty (main)
 .equ B_TIMEB,                    B_AFF + 48 ; show_time's text (main)
 .equ B_MNEXT,                    B_TIMEB + 32 ; media_next's line after the one found
 .equ B_UJ,                       B_MNEXT + 8 ; char[4096], url_join's URI (media queue)
-.equ B_SIZE,                     B_UJ + 4096
+.equ B_LTQUERY,                  B_UJ + 4096
+.equ B_SIZE,                     B_LTQUERY + 4096
 .equ GB_SIZE,                    ((G_SIZE + 15) & ~15) + B_SIZE ; G, then B, in one zeroed block from main
 
 	.text
@@ -4019,9 +4019,11 @@ fail_status:
 
 ; ---- This Mac: AVPlayer; macOS routes the sound to the chosen output (speakers, Bluetooth, AirPlay) ----
 
-; local_play(job) — play on This Mac with the engine: a file, web media, or a YouTube video's two streams.
+; local_play(job) — play on This Mac with the engine: a file, web media, or a YouTube video's two streams; while AirPlay plays, AVPlayer plays it there.
 local_play:
 	VM	Lp_lplay
+air_fallback:
+	VM	Lp_airfb
 	.pushsection __DATA,__data
 Lp_lplay:
 	GL	0
@@ -4033,25 +4035,32 @@ Lp_lplay:
 	LDX	JOB_DUR
 	STO	G_LTDUR
 	GL	0
-	ADDH	JOB_HLS
-	SL	1
-	CALL	F_strlcpy, "BbH"          ; YouTube's own HLS, for AirPlay
-	.short	B_LTVURL, 4096
+	LDX	JOB_QUERY
+	CALL	F_strlcpy, "BVH"
+	.short	B_LTQUERY, 4096
 	IMM	0
 	SW	G_FAILED
 	SW	G_HASVIDEO
 	SW	G_IDLE                    ; the controls stay a moment on a new track
-	NCALL	eng_mode
+	GL	0
+	ADDH	JOB_URL
+	SL	1
 	GL	0
 	LDW	JOB_KIND
 	SL	3
-	JNZ	Lp_lplay_engine
-	CALL	F_strlen, "=B"            ; YouTube: AirPlay takes its HLS, if it gave one
-	.short	B_LTVURL
-	JZ	Lp_lplay_air
-	IMM	3
-	HERE	Lp_lplay_air
+	JNZ	Lp_lplay_url
+	GL	0
+	ADDH	JOB_HLS
+	SL	1
+	HERE	Lp_lplay_url
+	CALL	F_strlcpy, "=BbH"
+	.short	B_LTPATH, 4096
 	STE	B_AIRK
+	NCALL	eng_mode, "=V"
+	EQ	2
+	JNZ	Lp_lplay_none
+	GL	3
+	JNZ	Lp_lplay_engine
 	CALL	F_malloc, "=I"
 	.byte	32
 	JZ	Lp_lplay_none
@@ -4086,24 +4095,17 @@ Lp_lplay:
 	HERE	Lp_lplay_none
 	OP_END
 	HERE	Lp_lplay_engine
-	GL	0
-	LDX	JOB_QUERY
-	SL	2
-	IMM	1                         ; AirPlay takes the same file or URL
-	SL	4
-	GL	3
-	EQ	KIND_FILE
-	JNZ	Lp_lplay_src
-	GL	0
-	ADDH	JOB_URL
-	SL	2
-	IMM	2
-	SL	4
+	LEAB	B_LTPATH
+	SL	1
+	LDE	B_LTQUERY
+	ANDH	255
+	EQ	'/'
+	SL	3
+	JZ	Lp_lplay_src
+	LEAB	B_LTQUERY
+	SL	1
 	HERE	Lp_lplay_src
-	GL	4
-	STE	B_AIRK
-	CALL	F_strlcpy, "=BcH"
-	.short	B_LTPATH, 1024
+	CALL	F_strlen, "=b"
 	ADDI	1
 	SL	4                         ; the source's size
 	ADDI	8
@@ -4116,9 +4118,8 @@ Lp_lplay:
 	GL	5
 	ADDI	8
 	SL	6
-	CALL	F_strlcpy, "gce"
+	CALL	F_strlcpy, "gbe"
 	GL	3
-	EQ	KIND_FILE
 	JZ	Lp_lplay_web
 	NCALL	eng_cmd, "Pf"
 	.long	eng_open - Lvm_base
@@ -4130,24 +4131,37 @@ Lp_lplay:
 	NCALL	local_poll
 	HERE	Lp_lplay_end
 	OP_END
+Lp_airfb:
+	IMM	0
+	STE	B_AIRK
+	NCALL	eng_mode, "V"
+	JMP	Lp_lplay_engine
 	.popsection
 
-; eng_mode — the engine plays: AVPlayer lets go.
+; eng_mode(airk) -> x0 = 1: the engine plays: AVPlayer lets go; 2: AirPlay played the last track and AVPlayer plays this one there (airk = B_AIRK).
 eng_mode:
 	FRAME	0
-	str	wzr, [x28, #G_MODE]
+	cbz	x0, 1f
+	bl	air_route
+	cbnz	w0, 2f
+1:	str	wzr, [x28, #G_MODE]
 	ldr	x0, [x28, #G_PLAYER]
 	mov	x2, #0
 	SEND	S_replaceCurrentItemWithPlayerItem_
-	mov	w9, #1
-	str	w9, [x28, #G_PLAYING]
+	mov	w0, #1
+	str	w0, [x28, #G_PLAYING]
+	b	Lret0
+2:	ldr	w0, [x28, #G_PLAYGEN]
+	bl	eng_fallback
+	mov	w0, #2
+	str	w0, [x28, #G_MODE]
 	b	Lret0
 
 ; local_poll() — publish This Mac's playback state (its own duration and picture, once known) and re-render.
 local_poll:
 	FRAME	4, 48                     ; a CMTime at sp + 16
-	ldr	w9, [x28, #G_MODE]
-	cbz	w9, Llq_engine
+	ldr	w22, [x28, #G_MODE]
+	cbz	w22, Llq_engine
 	ldr	x19, [x28, #G_PLAYER]
 Llq_poll:
 	mov	x0, x19
@@ -4158,7 +4172,8 @@ Llq_poll:
 	cbz	x0, Llq_time              ; nothing loaded
 	SEND	S_status
 	cmp	x0, #PLAYER_ITEM_FAILED
-	b.ne	Llq_item
+	b.ne	Llq_ready
+	tbnz	w22, #1, Llq_here
 	ldr	w9, [x28, #G_FAILED]
 	cbnz	w9, Llq_time
 	mov	w1, #1
@@ -4166,6 +4181,9 @@ Llq_poll:
 	CSTR	x0, "Could not play this media."
 	bl	set_status
 	b	Llq_time
+Llq_ready:
+	cbz	x0, Llq_item
+	str	w0, [x28, #G_MODE]
 Llq_item:
 	ldr	x9, [x28, #G_LTDUR]
 	cbnz	x9, Llq_size              ; YouTube said it
@@ -4288,6 +4306,11 @@ Llq_efail:
 	b.ne	Llq_show
 	ldr	w0, [x28, #G_PLAYGEN]     ; a decoder refused it: AVPlayer tries
 	bl	eng_fallback
+	b	Lret4
+Llq_here:
+	ldr	w9, [x28, #G_LOADING]
+	cbnz	w9, Llq_time
+	bl	air_fallback
 	b	Lret4
 
 ; video_tracks(item) — Audio Only turns the item's picture tracks off (nothing is decoded), and back on.
@@ -4477,6 +4500,8 @@ vol_to:
 
 ; air_prepare(self, _cmd, picker) — AirPlay's routes are shown: the dormant AVPlayer gets This Mac's media, paused, so that a picked TV takes it.
 	VMENTRY	air_prepare, Lp_air
+av_item:
+	VM	Lp_avitem
 	.pushsection __DATA,__data
 Lp_air:
 	LW	G_MODE
@@ -4485,42 +4510,18 @@ Lp_air:
 	MSG	S_currentItem, "="
 	JNZ	Lp_air_end
 	LDE	B_AIRK
-	SL	3
 	JZ	Lp_air_end
-	EQ	1
-	JZ	Lp_air_url
-	NCALL	mkstr, "=B"               ; a file
-	.short	B_LTPATH
-	SL	4
-	CLS	NSURL
-	MSG	S_fileURLWithPath_, "=e"
-	SL	4
-	CLS	AVPlayerItem
-	MSG	S_playerItemWithURL_, "=e"
-	MSG	S_retain, "="
-	JMP	Lp_air_item
-	HERE	Lp_air_url
-	GL	3
-	EQ	2
-	JNZ	Lp_air_web
-	GL	3
-	EQ	3
-	JZ	Lp_air_end
-	NCALL	make_item, "=B"           ; YouTube's own HLS
-	.short	B_LTVURL
-	JMP	Lp_air_item
-	HERE	Lp_air_web
-	NCALL	make_item, "=B"
-	.short	B_LTPATH
-	HERE	Lp_air_item
-	JZ	Lp_air_end
-	SL	4                         ; the dormant AVPlayer holds it, silent
-	LD	G_PLAYER
+	LD	G_PLAYER                  ; the dormant AVPlayer holds it, silent
+	MSG	S_pause
 	MSG	S_setMuted_, "I"
 	.byte	1
+Lp_avitem:
+	NCALL	make_item, "=B"
+	.short	B_LTPATH
+	SL	0
 	LD	G_PLAYER
-	MSG	S_replaceCurrentItemWithPlayerItem_, "e"
-	GL	4
+	MSG	S_replaceCurrentItemWithPlayerItem_, "a"
+	GL	0
 	MSG	S_release
 	HERE	Lp_air_end
 	OP_END
@@ -4552,6 +4553,10 @@ air_on:
 	ldr	x0, [x28, #G_PLAYER]
 	SEND	S_currentItem
 	cbz	x0, Lret0
+	b	Lar_route
+air_route:
+	FRAME	0
+Lar_route:
 	ldr	x0, [x28, #G_PLAYER]
 	SEND	S_isExternalPlaybackActive
 	cbnz	w0, Lret0
@@ -9317,8 +9322,10 @@ Leo_fail:
 	bl	post_main
 	b	Lret2
 
-; eng_fallback(generation) — the engine cannot play This Mac's file: AVPlayer tries it, unless a newer play came (main).
-	VMTENTRY	eng_fallback
+; eng_fallback(generation) — AVPlayer plays This Mac's media at G's volume, unless a newer play came: what the engine cannot play, or AirPlay's next track (main).
+	VMENTRY	eng_fallback, Lp_fallback
+	.pushsection __DATA,__data
+Lp_fallback:
 	LW	G_PLAYGEN
 	EQL	0
 	JZ	Lp_fallback_end
@@ -9327,32 +9334,13 @@ Leo_fail:
 	NCALL	eng_cmd, "PI"
 	.long	eng_close - Lvm_base
 	.byte	0
-	LDE	B_LTPATH
-	ANDH	255
-	EQ	'/'
-	JNZ	Lp_fallback_file
-	NCALL	mkurl, "=B"               ; web media
-	.short	B_LTPATH
-	JMP	Lp_fallback_item
-	HERE	Lp_fallback_file
-	NCALL	mkstr, "=B"
-	.short	B_LTPATH
-	SL	1
-	CLS	NSURL
-	MSG	S_fileURLWithPath_, "=b"
-	HERE	Lp_fallback_item
-	SL	1
-	CLS	AVPlayerItem
-	MSG	S_playerItemWithURL_, "=b"
-	SL	1
-	LD	G_PLAYER
-	MSG	S_replaceCurrentItemWithPlayerItem_, "b"
+	NCALL	av_item
 	LD	G_PLAYER
 	MSG	S_play
-	NCALL	local_poll
+	NCALL	vol_apply
 	HERE	Lp_fallback_end
 	OP_END
-	.p2align 2
+	.popsection
 
 ; mp4_open() -> w0 = 1 when the mapped file is an MP4 or QuickTime movie with a picture or sound CoreMedia knows: its tracks are read and the first of each kind plays.
 mp4_open:
