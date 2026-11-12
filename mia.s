@@ -581,6 +581,7 @@ Lc\@:	.asciz	"\text"
 .equ RENDER_FAILED,              2        ; AVQueuedSampleBufferRenderingStatusFailed
 .equ WAIT_TRIES,                 2000     ; 5 ms polls for the first picture before the clock starts anyway
 .equ WAIT_NS,                    5000000
+.equ SOUND_TRIES,                200
 .equ LEAD_MS,                    350      ; a picture queued at most this far ahead (net_tick asks again every eighth of a second; 2x speed still has a tick to spare)
 .equ AUDIO_PREROLL,              2        ; packets decoded before a seek target, so the decoder has its overlap
 .equ ABATCH,                     7        ; at most 2^7 sound samples in a row per buffer: each buffer costs the renderer ~130k instructions
@@ -1531,7 +1532,8 @@ _\name:
 .equ CC_SIZE,                    CC_Q + 6 * CC_E
 .equ E_MSEQ,                     (E_CC + CC_SIZE + 7) & ~7
 .equ E_MTIME,                    E_MSEQ + 8
-.equ E_ST,                       (E_MTIME + 8 + 63) & ~63 ; Stream[STREAMS]
+.equ E_FED,                      E_MTIME + 8
+.equ E_ST,                       (E_FED + 8 + 63) & ~63 ; Stream[STREAMS]
 .equ E_TR,                       (E_ST + STREAMS * ST_SIZE + 63) & ~63 ; Track[TRACKS]
 .equ E_CLRN,                     E_TR + TRACKS * TR_SIZE - E_CLR
 .equ B_RQT,                      E_TR + TRACKS * TR_SIZE ; {task, record}[RQS]: requests running (media queue)
@@ -4249,7 +4251,8 @@ Llq_engine:
 	str	w10, [x13]
 	stp	w11, w12, [x13, #4]
 	bl	pic_layout
-1:	bl	now_ms
+1:	ldr	w24, [x27, #E_HOLD]
+	bl	now_ms
 	mov	x22, x0                   ; ms
 	mov	x11, #1000
 	sdiv	x21, x22, x11
@@ -4285,15 +4288,14 @@ Llq_engine:
 	mov	x0, #0
 	bl	_dispatch_time
 	MAINQ	x1
-	mov	x2, #0
 	adr	x3, ui_poll
 	bl	_dispatch_after_f
 	b	Llq_efail
 Llq_end:
+	tbnz	w24, #0, Llq_efail
 	str	wzr, [x28, #G_PLAYING]    ; the end: it pauses there
 	mov	w20, #0
 	adr	x0, eng_rate
-	mov	x1, #0
 	bl	eng_cmd
 Llq_efail:
 	ldr	x0, [x27, #E_VR]
@@ -4409,10 +4411,10 @@ local_seekms:
 	str	x0, [x28, #G_SEEKTO]      ; the engine: seeks queued while one runs collapse into the newest
 	add	x9, x28, #G_SEEKPEND
 	mov	w10, #1
+	str	w10, [x27, #E_HOLD]
 	swpal	w10, w10, [x9]
 	cbnz	w10, Lls_poll
 	adr	x0, eng_seekq
-	mov	x1, #0
 	bl	eng_cmd
 Lls_poll:
 	bl	local_poll
@@ -4431,8 +4433,7 @@ Lls_av:
 	add	x3, sp, #24
 	add	x4, sp, #24
 	SEND	S_seekToTime_toleranceBefore_toleranceAfter_
-	bl	local_poll
-	b	Lret0
+	b	Lls_poll
 
 ; local_stop() — pause and rewind This Mac.
 local_stop:
@@ -4476,7 +4477,6 @@ vol_apply:
 	ldr	x0, [x28, #G_PLAYER]
 	bl	vol_to
 	adr	x0, eng_vol
-	mov	x1, #0
 	bl	eng_cmd
 	bl	local_poll
 	b	Lret0
@@ -4535,7 +4535,6 @@ air_handoff:
 	mov	w9, #1
 	str	w9, [x28, #G_MODE]
 	adr	x0, eng_close
-	mov	x1, #0
 	bl	eng_cmd
 	bl	vol_apply
 	mov	x0, x19
@@ -9306,7 +9305,6 @@ Leo_read:
 	mov	x0, #0
 	bl	eng_seek                 ; from the start
 	adr	x0, ui_poll
-	mov	x1, #0
 	bl	post_main
 	b	Lret2
 Leo_close:
@@ -10472,6 +10470,7 @@ trk_request:
 feed:
 	FRAME	2, 0, 1
 	cbz	x19, Lfe_stop
+	str	x19, [x27, #E_FED]
 Lfe_more:
 	mov	x0, x20
 	SEND	S_isReadyForMoreMediaData
@@ -10526,6 +10525,7 @@ Lp_seek:
 	GL	0
 	STE	E_TGTMS
 	IMM	0
+	STE	E_FED
 	STE	E_FIRSTMS
 	STEW	E_PREV
 	STE	E_T0
@@ -10556,10 +10556,16 @@ Lp_seek:
 	HERE	Lp_seek_sound             ; no picture: the clock and the sound at once
 	NCALL	hold, "a"
 	GL	2
-	JZ	Lp_seek_wait
+	JZ	Lp_seek_mute
 	NCALL	trk_play, "cEPa"
 	.short	E_AR
 	.long	Lblk_a - Lvm_base
+	GL	2
+	LDX	TR_FD
+	JNZ	Lp_seek_wait
+	HERE	Lp_seek_mute
+	IMM	1
+	STE	E_FED
 	HERE	Lp_seek_wait
 	NCALL	sub_seek, "a"
 	NCALL	await
@@ -10723,14 +10729,14 @@ await:
 	ldr	w9, [x27, #E_WAITGEN]
 	cmp	w0, w9
 	b.ne	Lret0                     ; a newer seek waits instead
-	ldr	w9, [x27, #E_WANTV]
-	cbz	w9, Lew_go
-	ldr	w9, [x28, #G_AONLY]
-	cbnz	w9, Lew_go
 	ldr	w9, [x27, #E_WAITN]
 	subs	w9, w9, #1
 	b.lo	Lew_go
 	str	w9, [x27, #E_WAITN]
+	ldr	w10, [x27, #E_WANTV]
+	cbz	w10, Lew_snd
+	ldr	w10, [x28, #G_AONLY]
+	cbnz	w10, Lew_snd
 	ldr	x0, [x28, #G_SBLAYER]
 	SEND	S_isReadyForDisplay
 	ldr	x10, [x27, #E_FIRSTMS]
@@ -10760,6 +10766,11 @@ await:
 	adr	x3, eng_wait
 	bl	_dispatch_after_f
 	b	Lret0
+Lew_snd:
+	ldr	x10, [x27, #E_FED]
+	cbnz	x10, Lew_go
+	cmp	w9, #(WAIT_TRIES - SOUND_TRIES)
+	b.hi	1b
 Lew_go:
 	str	wzr, [x27, #E_HOLD]
 	ldr	w9, [x27, #E_HOLDGEN]
@@ -10767,11 +10778,12 @@ Lew_go:
 	cmp	w9, w10
 	b.eq	1f
 	ldr	x0, [x28, #G_CLOCKQ]      ; the clock goes on after its hold, on the queue that holds it
-	mov	x1, #0
 	adr	x2, eng_rate
 	bl	_dispatch_async_f
-	b	Lret0
+	b	2f
 1:	bl	Leng_rate
+2:	adr	x0, ui_poll
+	bl	post_main
 	b	Lret0
 
 ; eng_rate — the clock runs at the chosen speed while playing, else holds; not while a seek waits for its picture.
@@ -12027,7 +12039,6 @@ speed_rate:
 	fdiv	s0, s0, s1
 	str	s0, [x28, #G_RATE]
 	adr	x0, eng_rate
-	mov	x1, #0
 	bl	eng_cmd
 	ldr	x0, [x28, #G_PLAYER]
 	SEND	S_setDefaultRate_         ; play uses it from now on
@@ -12843,7 +12854,6 @@ Lmn_regged:
 	bl	local_poll
 	bl	layout_stage
 	adr	x0, eng_init
-	mov	x1, #0
 	bl	eng_cmd
 	ADDR	x0, Lprog_run
 	bl	ui_run
