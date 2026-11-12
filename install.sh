@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 app=MIA.app
-version=1.0.3
+version=1.0.5
 
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
